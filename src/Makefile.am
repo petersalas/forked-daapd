@@ -134,6 +134,7 @@ forked_daapd_SOURCES = main.c \
 	outputs.h outputs.c \
 	outputs/rtp_common.h outputs/rtp_common.c \
 	outputs/raop.c $(RAOP_VERIFICATION_SRC) \
+	outputs/airplay.c \
 	outputs/streaming.c outputs/dummy.c outputs/fifo.c \
 	$(ALSA_SRC) $(PULSEAUDIO_SRC) $(CHROMECAST_SRC) \
 	evrtsp/rtsp.c evrtsp/evrtsp.h evrtsp/rtsp-internal.h evrtsp/log.h \
