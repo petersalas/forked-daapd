@@ -4598,8 +4598,8 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
   if (keyval_get(&features, "Authentication_8"))
     re->supports_auth_setup = 1;
-  if (keyval_get(&features, "SupportsSystemPairing")) // Not sure if this is the correct one?
-    rd->requires_auth = 1;
+//  if (keyval_get(&features, "SupportsSystemPairing")) // Not sure if this is the correct one?
+//    rd->requires_auth = 1;
 
   keyval_clear(&features);
 
