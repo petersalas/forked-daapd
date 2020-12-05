@@ -26,7 +26,7 @@ MPD_SRC=mpd.c mpd.h
 endif
 
 if COND_RAOP_VERIFICATION
-RAOP_VERIFICATION_SRC=outputs/raop_verification.c outputs/raop_verification.h
+RAOP_VERIFICATION_SRC=outputs/pair_fruit.c outputs/pair.h
 endif
 
 if COND_ALSA
