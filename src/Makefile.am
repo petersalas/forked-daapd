@@ -26,7 +26,8 @@ MPD_SRC=mpd.c mpd.h
 endif
 
 if COND_RAOP_VERIFICATION
-RAOP_VERIFICATION_SRC=outputs/pair_fruit.c outputs/pair.h
+RAOP_VERIFICATION_SRC=outputs/pair_fruit.c outputs/pair_homekit.c outputs/pair.c outputs/pair-internal.h outputs/pair.h
+AM_CPPFLAGS += -DCONFIG_GCRYPT
 endif
 
 if COND_ALSA

@@ -95,6 +95,8 @@
 // This is an arbitrary value which just needs to be kept in sync with the config
 #define RAOP_CONFIG_MAX_VOLUME     11
 
+const char *pair_device_id = "AABBCCDD11223344"; // TODO use actual ID
+
 union sockaddr_all
 {
   struct sockaddr_in sin;
@@ -4281,7 +4283,7 @@ airplay_pair_verify(struct airplay_session *rs)
   if (!device)
     goto error;
 
-  CHECK_NULL(L_RAOP, rs->pair_verify_ctx = pair_verify_new(device->auth_key));
+  CHECK_NULL(L_RAOP, rs->pair_verify_ctx = pair_verify_new(PAIR_HOMEKIT, device->auth_key, pair_device_id));
 
   ret = airplay_pair_request_send(4, rs, airplay_cb_pair_verify_step1);
   if (ret < 0)
@@ -4391,7 +4393,7 @@ airplay_pair_setup(struct airplay_session *rs, const char *pin)
 {
   int ret;
 
-  rs->pair_setup_ctx = pair_setup_new(pin);
+  rs->pair_setup_ctx = pair_setup_new(PAIR_HOMEKIT, pin, pair_device_id);
   if (!rs->pair_setup_ctx)
     {
       DPRINTF(E_LOG, L_RAOP, "Out of memory for verification setup context\n");
