@@ -1907,6 +1907,8 @@ session_free(struct airplay_session *rs)
   if (rs->server_fd >= 0)
     close(rs->server_fd);
 
+  pair_cipher_free(rs->pair_cipher_ctx);
+
   free(rs->realm);
   free(rs->nonce);
   free(rs->session);
@@ -4055,7 +4057,7 @@ airplay_cb_startup_options(struct evrtsp_request *req, void *arg)
 }
 
 
-/* ------------------------- tvOS device verification ----------------------- */
+/* ------------------------ Pairing/device verification --------------------- */
 /*                 e.g. for the ATV4 (read it from the bottom and up)         */
 
 #ifdef RAOP_VERIFICATION
@@ -4103,7 +4105,8 @@ airplay_pair_response_process(int step, struct evrtsp_request *req, struct airpl
 	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
 	break;
       case 5:
-	ret = 0;
+	ret = pair_verify_response2(rs->pair_verify_ctx, response, len);
+	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
 	break;
       default:
 	ret = -1;
@@ -4241,42 +4244,40 @@ airplay_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
   const uint8_t *shared_secret;
   int ret;
 
+  ret = airplay_pair_response_process(5, req, rs);
+  if (ret < 0)
+    goto error;
+
   ret = pair_verify_result(&shared_secret, rs->pair_verify_ctx);
   if (ret < 0)
-    return;
+    goto error;
 
   rs->pair_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, shared_secret);
   if (!rs->pair_cipher_ctx)
-    return;
+    goto error;
 
   evrtsp_connection_set_ciphercb(rs->ctrl, airplay_rtsp_cipher, rs);
 
-  // TODO better error handling
-
-  pair_verify_free(rs->pair_verify_ctx);
-
-  ret = airplay_pair_response_process(5, req, rs);
-  if (ret < 0)
-    {
-      device = outputs_device_get(rs->device_id);
-      if (!device)
-	goto error;
-
-      // Clear auth_key, the device did not accept it
-      free(device->auth_key);
-      device->auth_key = NULL;
-      goto error;
-    }
-
-  DPRINTF(E_INFO, L_RAOP, "Verification of '%s' completed succesfully\n", rs->devname);
+  DPRINTF(E_INFO, L_RAOP, "Verification of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
 
   rs->state = RAOP_STATE_STARTUP;
 
   airplay_send_req_options(rs, airplay_cb_startup_options, "verify_step2");
 
+  pair_verify_free(rs->pair_verify_ctx);
   return;
 
  error:
+  pair_verify_free(rs->pair_verify_ctx);
+
+  device = outputs_device_get(rs->device_id);
+  if (!device)
+    return;
+
+  // Clear auth_key, the device did not accept it, or some other unexpected error
+  free(device->auth_key);
+  device->auth_key = NULL;
+
   rs->state = RAOP_STATE_PASSWORD;
   session_failure(rs);
 }
