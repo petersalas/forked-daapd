@@ -1598,6 +1598,13 @@ pair_verify_response1(struct pair_verify_context *vctx, const uint8_t *data, uin
   return -1;
 }
 
+static int
+pair_verify_response2(struct pair_verify_context *vctx, const uint8_t *data, uint32_t data_len)
+{
+  // TODO actually check response
+  return 0;
+}
+
 static void
 pair_cipher_free(struct pair_cipher_context *cctx)
 {
@@ -1762,6 +1769,7 @@ struct pair_definition pair_homekit =
   .pair_verify_request2 = pair_verify_request2,
 
   .pair_verify_response1 = pair_verify_response1,
+  .pair_verify_response2 = pair_verify_response2,
 
   .pair_cipher_new = pair_cipher_new,
   .pair_cipher_free = pair_cipher_free,
