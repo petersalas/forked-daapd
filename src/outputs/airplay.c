@@ -220,7 +220,8 @@ struct airplay_session
   unsigned short timing_port; // ATV4 has this set to 0, but it is not used by forked-daapd anyway
 
 #ifdef RAOP_VERIFICATION
-  /* Device verification, see pair.h */
+  /* Homekit pairing, see pair.h */
+  struct pair_cipher_context *pair_cipher_ctx;
   struct pair_verify_context *pair_verify_ctx;
   struct pair_setup_context *pair_setup_ctx;
 #endif
@@ -4131,20 +4132,20 @@ airplay_pair_request_send(int step, struct airplay_session *rs, void (*cb)(struc
       case 1:
 	body    = pair_setup_request1(&len, rs->pair_setup_ctx);
 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup-pin";
-	ctype   = "application/x-apple-binary-plist";
+	url     = "/pair-setup";
+	ctype   = "application/octet-stream";
 	break;
       case 2:
 	body    = pair_setup_request2(&len, rs->pair_setup_ctx);
 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup-pin";
-	ctype   = "application/x-apple-binary-plist";
+	url     = "/pair-setup";
+	ctype   = "application/octet-stream";
 	break;
       case 3:
 	body    = pair_setup_request3(&len, rs->pair_setup_ctx);
 	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup-pin";
-	ctype   = "application/x-apple-binary-plist";
+	url     = "/pair-setup";
+	ctype   = "application/octet-stream";
 	break;
       case 4:
 	body    = pair_verify_request1(&len, rs->pair_verify_ctx);
@@ -4187,6 +4188,7 @@ airplay_pair_request_send(int step, struct airplay_session *rs, void (*cb)(struc
     }
 
   evrtsp_add_header(req->output_headers, "Content-Type", ctype);
+  evrtsp_add_header(req->output_headers, "X-Apple-HKP", "3"); // Required!!
 
   DPRINTF(E_INFO, L_RAOP, "Making verification request step %d to '%s'\n", step, rs->devname);
 
@@ -4205,11 +4207,51 @@ airplay_pair_request_send(int step, struct airplay_session *rs, void (*cb)(struc
 }
 
 static void
+airplay_rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
+{
+  struct airplay_session *rs = arg;
+  uint8_t *out = NULL;
+  size_t out_len = 0;
+  int ret;
+
+  uint8_t *in = evbuffer_pullup(evbuf, -1);
+  size_t in_len = evbuffer_get_length(evbuf);
+
+  if (encrypt)
+    ret = pair_encrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
+  else
+    ret = pair_decrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
+
+  evbuffer_drain(evbuf, in_len);
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Error while ciphering: %s\n", pair_cipher_errmsg(rs->pair_cipher_ctx));
+      return;
+    }
+
+  evbuffer_add(evbuf, out, out_len);
+}
+
+static void
 airplay_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
 {
   struct airplay_session *rs = arg;
   struct output_device *device;
+  const uint8_t *shared_secret;
   int ret;
+
+  ret = pair_verify_result(&shared_secret, rs->pair_verify_ctx);
+  if (ret < 0)
+    return;
+
+  rs->pair_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, shared_secret);
+  if (!rs->pair_cipher_ctx)
+    return;
+
+  evrtsp_connection_set_ciphercb(rs->ctrl, airplay_rtsp_cipher, rs);
+
+  // TODO better error handling
 
   pair_verify_free(rs->pair_verify_ctx);
 
@@ -4604,8 +4646,8 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
   if (keyval_get(&features, "Authentication_8"))
     re->supports_auth_setup = 1;
-//  if (keyval_get(&features, "SupportsSystemPairing")) // Not sure if this is the correct one?
-//    rd->requires_auth = 1;
+  if (keyval_get(&features, "SupportsHKPairingAndAccessControl"))
+    rd->requires_auth = 1;
 
   keyval_clear(&features);
 
