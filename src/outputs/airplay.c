@@ -48,6 +48,8 @@
 #include <event2/buffer.h>
 #include <gcrypt.h>
 
+#include <plist/plist.h>
+
 #include "evrtsp/evrtsp.h"
 #include "conffile.h"
 #include "logger.h"
@@ -185,6 +187,7 @@ struct airplay_session
   struct airplay_master_session *master_session;
 
   struct evrtsp_connection *ctrl;
+  struct evrtsp_connection *event;
 
   enum airplay_state state;
 
@@ -214,9 +217,10 @@ struct airplay_session
 
   int volume;
 
-  /* AirTunes v2 */
-  unsigned short server_port;
+  char *client_address;
+  unsigned short data_port;
   unsigned short control_port;
+  unsigned short event_port; // What is this used for?
   unsigned short timing_port; // ATV4 has this set to 0, but it is not used by forked-daapd anyway
 
 #ifdef RAOP_VERIFICATION
@@ -1151,6 +1155,7 @@ airplay_check_cseq(struct airplay_session *rs, struct evrtsp_request *req)
   return 0;
 }
 
+/*
 static int
 airplay_make_sdp(struct airplay_session *rs, struct evrtsp_request *req, char *address, int family, uint32_t session_id)
 {
@@ -1187,7 +1192,7 @@ airplay_make_sdp(struct airplay_session *rs, struct evrtsp_request *req, char *a
   if (p)
     *p = '\0';
 
-  /* Add SDP payload - but don't add RSA/AES key/iv if no encryption - important for ATV3 update 6.0 */
+  // Add SDP payload - but don't add RSA/AES key/iv if no encryption - important for ATV3 update 6.0
   if (rs->encrypt)
     ret = evbuffer_add_printf(req->output_buffer, SDP_PLD_FMT,
 			      session_id, af, address, rs_af, rs->address, RAOP_SAMPLES_PER_PACKET,
@@ -1212,7 +1217,7 @@ airplay_make_sdp(struct airplay_session *rs, struct evrtsp_request *req, char *a
 #undef SDP_PLD_FMT
 #undef SDP_PLD_FMT_NO_ENC
 }
-
+*/
 
 /* ----------------- Handlers for sending RAOP/RTSP requests ---------------- */
 
@@ -1384,12 +1389,247 @@ airplay_send_req_set_parameter(struct airplay_session *rs, struct evbuffer *evbu
   return 0;
 }
 
+static void
+dict_add_uint(plist_t node, const char *key, uint64_t val)
+{
+  plist_t add = plist_new_uint(val);
+  plist_dict_set_item(node, key, add);
+}
+
+static void
+dict_add_string(plist_t node, const char *key, const char *val)
+{
+  plist_t add = plist_new_string(val);
+  plist_dict_set_item(node, key, add);
+}
+
+static void
+dict_add_bool(plist_t node, const char *key, bool val)
+{
+  plist_t add = plist_new_bool(val);
+  plist_dict_set_item(node, key, add);
+}
+
+static void
+dict_add_data(plist_t node, const char *key, uint8_t *data, size_t len)
+{
+  plist_t add = plist_new_data((const char *)data, len);
+  plist_dict_set_item(node, key, add);
+}
+
+
+/*
+Audio formats
+
+Bit 	Value 	Type
+2 	0x4 	PCM/8000/16/1
+3 	0x8 	PCM/8000/16/2
+4 	0x10 	PCM/16000/16/1
+5 	0x20 	PCM/16000/16/2
+6 	0x40 	PCM/24000/16/1
+7 	0x80 	PCM/24000/16/2
+8 	0x100 	PCM/32000/16/1
+9 	0x200 	PCM/32000/16/2
+10 	0x400 	PCM/44100/16/1
+11 	0x800 	PCM/44100/16/2
+12 	0x1000 	PCM/44100/24/1
+13 	0x2000 	PCM/44100/24/2
+14 	0x4000 	PCM/48000/16/1
+15 	0x8000 	PCM/48000/16/2
+16 	0x10000 	PCM/48000/24/1
+17 	0x20000 	PCM/48000/24/2
+18 	0x40000 	ALAC/44100/16/2
+19 	0x80000 	ALAC/44100/24/2
+20 	0x100000 	ALAC/48000/16/2
+21 	0x200000 	ALAC/48000/24/2
+22 	0x400000 	AAC-LC/44100/2
+23 	0x800000 	AAC-LC/48000/2
+24 	0x1000000 	AAC-ELD/44100/2
+25 	0x2000000 	AAC-ELD/48000/2
+26 	0x4000000 	AAC-ELD/16000/1
+27 	0x8000000 	AAC-ELD/24000/1
+28 	0x10000000 	OPUS/16000/1
+29 	0x20000000 	OPUS/24000/1
+30 	0x40000000 	OPUS/48000/1
+31 	0x80000000 	AAC-ELD/44100/1
+32 	0x100000000 	AAC-ELD/48000/1
+*/
+
+
+// {'streams': [{'audioFormat': 262144,
+//           'audioMode': 'default',
+//           'controlPort': 60242,
+//           'ct': 2,
+//           'isMedia': True,
+//           'latencyMax': 88200,
+//           'latencyMin': 11025,
+//           'shk': b'\xdbc\x9b,\xdb\x15\x82\x19\x0b\xbf\xd3\xd0\x81\xc5\x7f7'
+//                  b'\xaf\x7f\xb2l\xec\xca\xc8\xd0\x8d\x9d\x1d\xa8'
+//                  b'\xda\xa2\xf7\xd0',
+//           'spf': 352,
+//           'supportsDynamicStreamID': True,
+//           'type': 96}]}
+
+static int
+req_setup2_payload_create(char **data, uint32_t *len, int control_port)
+{
+  plist_t root;
+  plist_t streams;
+  plist_t stream;
+  uint8_t shk[32] = { 0 };
+
+  stream = plist_new_dict();
+  dict_add_uint(stream, "audioFormat", 262144); // 0x40000 ALAC/44100/16/2
+  dict_add_string(stream, "audioMode", "default");
+  dict_add_uint(stream, "controlPort", control_port);
+  dict_add_uint(stream, "ct", 2); // Compression type, 1 LPCM, 2 ALAC, 3 AAC, 4 AAC ELD, 32 OPUS
+  dict_add_bool(stream, "isMedia", true); // ?
+  dict_add_uint(stream, "latencyMax", 88200);
+  dict_add_uint(stream, "latencyMin", 11025);
+  dict_add_data(stream, "shk", shk, sizeof(shk));
+  dict_add_uint(stream, "spf", 352); // frames per packet
+  dict_add_bool(stream, "supportsDynamicStreamID", false);
+  dict_add_uint(stream, "type", 96); // RTP type, 96 real time, 103 buffered
+  streams = plist_new_array();
+  plist_array_append_item(streams, stream);
+
+  root = plist_new_dict();
+  plist_dict_set_item(root, "streams", streams);
+
+  *data = NULL; // Very important
+  plist_to_bin(root, data, len);
+  if (!(*data))
+    return -1;
+
+  plist_free(root);
+
+  return 0;
+}
+
+static int
+airplay_send_req_setup2(struct airplay_session *rs, evrtsp_req_cb cb, const char *log_caller)
+{
+  struct evrtsp_request *req = NULL;
+  char *data;
+  uint32_t len;
+  int ret;
+
+  req = evrtsp_request_new(cb, rs);
+  if (!req)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SETUP\n");
+      goto error;
+    }
+
+  ret = airplay_add_headers(rs, req, EVRTSP_REQ_SETUP);
+  if (ret < 0)
+    {
+      goto error;
+    }
+
+  evrtsp_add_header(req->output_headers, "Content-Type", "application/x-apple-binary-plist");
+
+  ret = req_setup2_payload_create(&data, &len, rs->control_svc->port);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create plist body for SETUP\n");
+      goto error;
+    }
+
+  evbuffer_add(req->output_buffer, (unsigned char *)data, len);
+
+  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SETUP, rs->session_url);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not make SETUP request to '%s'\n", rs->devname);
+      goto error;
+    }
+
+  rs->reqs_in_flight++;
+
+  return 0;
+
+ error:
+  evrtsp_request_free(req);
+  return -1;
+}
+
+static int
+req_setpeers_payload_create(char **data, uint32_t *len, const char *sender_address, const char *receiver_address)
+{
+  plist_t root;
+
+  // TODO also have ipv6
+  root = plist_new_array();
+  plist_t receiver = plist_new_string(receiver_address);
+  plist_array_append_item(root, receiver);
+  plist_t sender = plist_new_string(sender_address);
+  plist_array_append_item(root, sender);
+
+  *data = NULL; // Very important
+  plist_to_bin(root, data, len);
+  if (!(*data))
+    return -1;
+
+  plist_free(root);
+
+  return 0;
+}
+
+static int
+airplay_send_req_setpeers(struct airplay_session *rs, evrtsp_req_cb cb, const char *log_caller)
+{
+  struct evrtsp_request *req;
+  char *data;
+  uint32_t len;
+  int ret;
+
+  DPRINTF(E_DBG, L_RAOP, "%s: Sending SETPEERS to '%s'\n", log_caller, rs->devname);
+
+  req = evrtsp_request_new(cb, rs);
+  if (!req)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SETPEERS\n");
+      return -1;
+    }
+
+  ret = airplay_add_headers(rs, req, EVRTSP_REQ_SETPEERS);
+  if (ret < 0)
+    {
+      evrtsp_request_free(req);
+      return -1;
+    }
+
+  evrtsp_add_header(req->output_headers, "Content-Type", "/peer-list-changed"); // Weird contenttype...
+
+  ret = req_setpeers_payload_create(&data, &len, rs->address, rs->client_address);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create plist body for SETPEERS\n");
+      return -1;
+    }
+
+  evbuffer_add(req->output_buffer, (unsigned char *)data, len);
+
+  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SETPEERS, rs->session_url);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not make SETPEERS request to '%s'\n", rs->devname);
+
+      return -1;
+    }
+
+  rs->reqs_in_flight++;
+
+  return 0;
+}
+
 static int
 airplay_send_req_record(struct airplay_session *rs, evrtsp_req_cb cb, const char *log_caller)
 {
-  struct airplay_master_session *rms = rs->master_session;
+//  struct airplay_master_session *rms = rs->master_session;
   struct evrtsp_request *req;
-  char buf[64];
+//  char buf[64];
   int ret;
 
   DPRINTF(E_DBG, L_RAOP, "%s: Sending RECORD to '%s'\n", log_caller, rs->devname);
@@ -1409,9 +1649,11 @@ airplay_send_req_record(struct airplay_session *rs, evrtsp_req_cb cb, const char
       return -1;
     }
 
-  evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+//  evrtsp_add_header(req->output_headers, "X-Apple-ProtocolVersion", "1");
 
-  /* Start sequence: next sequence */
+/*  evrtsp_add_header(req->output_headers, "Range", "npt=0-");
+
+  // Start sequence: next sequence
   ret = snprintf(buf, sizeof(buf), "seq=%" PRIu16 ";rtptime=%u", rms->rtp_session->seqnum, rms->rtp_session->pos);
   if ((ret < 0) || (ret >= sizeof(buf)))
     {
@@ -1423,7 +1665,7 @@ airplay_send_req_record(struct airplay_session *rs, evrtsp_req_cb cb, const char
   evrtsp_add_header(req->output_headers, "RTP-Info", buf);
 
   DPRINTF(E_DBG, L_RAOP, "RTP-Info is %s\n", buf);
-
+*/
   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_RECORD, rs->session_url);
   if (ret < 0)
     {
@@ -1437,56 +1679,203 @@ airplay_send_req_record(struct airplay_session *rs, evrtsp_req_cb cb, const char
   return 0;
 }
 
+// {'deviceID': '11:22:33:44:55:66',
+//  'eiv': b'=o\xa0\xc24\xcd\xee\xcb9\x99~l\x140\x08\x9c',
+//  'ekey': b'\x08\x90x\xa6\x0e\x87$C\x88l\xc1MS[Q\xaf',
+//  'et': 0,
+//  'groupContainsGroupLeader': False,
+//  'groupUUID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
+//  'isMultiSelectAirPlay': True,
+//  'macAddress': '11:22:33:44:55:68',
+//  'model': 'iPhone10,6',
+//  'name': 'iPXema',
+//  'osBuildVersion': '17B111',
+//  'osName': 'iPhone OS',
+//  'osVersion': '13.2.3',
+//  'senderSupportsRelay': True,
+//  'sessionUUID': '3195C737-1E6E-4487-BECB-4D287B7C7626',
+//  'sourceVersion': '409.16',
+//  'timingPeerInfo': {'Addresses': ['192.168.1.86', 'fe80::473:74c7:28a7:3bee'],
+//                     'ID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
+//                     'SupportsClockPortMatchingOverride': True},
+//  'timingPeerList': [{'Addresses': ['192.168.1.86', 'fe80::473:74c7:28a7:3bee'],
+//                      'ID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
+//                      'SupportsClockPortMatchingOverride': True}],
+//  'timingProtocol': 'PTP'}
+
+static int
+req_setup1_payload_create(char **data, uint32_t *len, int timing_port, const char *client_address)
+{
+  plist_t root;
+//  plist_t timingpeerinfo;
+//  plist_t timingpeerlist;
+  plist_t addresses;
+  plist_t address;
+
+  address = plist_new_string(client_address);
+  addresses = plist_new_array();
+  plist_array_append_item(addresses, address);
+
+/*  timingpeerinfo = plist_new_dict();
+  plist_dict_set_item(timingpeerinfo, "Addresses", addresses);
+  dict_add_string(timingpeerinfo, "ID", "67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB");
+  dict_add_bool(timingpeerinfo, "SupportsClockPortMatchingOverride", false);
+*/
+/*  timingpeerlist = plist_new_dict();
+  plist_dict_set_item(timingpeerlist, "Addresses", addresses);
+  dict_add_string(timingpeerlist, "ID", "67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB");
+  dict_add_bool(timingpeerlist, "SupportsClockPortMatchingOverride", false);
+*/
+  root = plist_new_dict();
+  dict_add_string(root, "deviceID", "11:22:33:44:55:66");
+//  dict_add_data(root, "eiv", airplay_aes_iv, sizeof(airplay_aes_iv));
+//  dict_add_data(root, "ekey", airplay_aes_key, sizeof(airplay_aes_key));
+//  dict_add_uint(root, "et", 0); // No encryption?
+  dict_add_bool(root, "groupContainsGroupLeader", true);
+  dict_add_string(root, "groupUUID", "3195C737-1E6E-4487-BECB-4D287B7C1234");
+  dict_add_bool(root, "internalBuild", false);
+  dict_add_bool(root, "isMultiSelectAirPlay", true);
+  dict_add_string(root, "macAddress", "00:0c:29:f6:4a:f9");
+  dict_add_string(root, "model", "iPhone10,4");
+  dict_add_string(root, "osBuildVersion", "18B92");
+  dict_add_string(root, "osName", "iPhone OS");
+  dict_add_string(root, "osVersion", "14.2");
+  dict_add_bool(root, "senderSupportsRelay", true);
+  dict_add_string(root, "sessionUUID", "3195C737-1E6E-4487-BECB-4D287B7C7626");
+  dict_add_string(root, "sourceVersion", "525.38.2");
+//  plist_dict_set_item(root, "timingPeerInfo", timingpeerinfo); // only for PTP timing?
+//  plist_dict_set_item(root, "timingPeerList", timingpeerlist); // only for PTP timing?
+  dict_add_uint(root, "timingPort", timing_port);
+  dict_add_string(root, "timingProtocol", "NTP");
+
+  *data = NULL; // Very important
+  plist_to_bin(root, data, len);
+  if (!(*data))
+    return -1;
+
+  plist_free(root);
+
+  return 0;
+}
+
+static int
+session_url_set(struct airplay_session *rs)
+{
+  char *address = NULL;
+  char *intf;
+  unsigned short port;
+  int family;
+  uint32_t session_id;
+  int ret;
+
+  // Determine local address, needed for SDP and session URL
+  evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
+  if (!address || (port == 0))
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not determine local address\n");
+      goto error;
+    }
+
+  intf = strchr(address, '%');
+  if (intf)
+    {
+      *intf = '\0';
+      intf++;
+    }
+
+  DPRINTF(E_DBG, L_RAOP, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
+
+  // Session ID and session URL
+  gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
+
+  if (family == AF_INET)
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, session_id);
+  else
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, session_id);
+  if ((ret < 0) || (ret >= sizeof(rs->session_url)))
+    {
+      DPRINTF(E_LOG, L_RAOP, "Session URL length exceeds 127 characters\n");
+      goto error;
+    }
+
+  rs->client_address = address;
+  return 0;
+
+ error:
+  free(address);
+  return -1;
+}
+
 static int
 airplay_send_req_setup(struct airplay_session *rs, evrtsp_req_cb cb, const char *log_caller)
 {
-  char hdr[128];
-  struct evrtsp_request *req;
+  struct evrtsp_request *req = NULL;
+  char *data;
+  uint32_t len;
   int ret;
 
   DPRINTF(E_DBG, L_RAOP, "%s: Sending SETUP to '%s'\n", log_caller, rs->devname);
+
+  ret = session_url_set(rs);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not make session url for device '%s'\n", rs->devname);
+      goto error;
+    }
 
   req = evrtsp_request_new(cb, rs);
   if (!req)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for SETUP\n");
-
-      return -1;
+      goto error;
     }
 
   ret = airplay_add_headers(rs, req, EVRTSP_REQ_SETUP);
   if (ret < 0)
     {
-      evrtsp_request_free(req);
-      return -1;
+      goto error;
     }
 
-  /* Request UDP transport, AirTunes v2 streaming */
-  ret = snprintf(hdr, sizeof(hdr), "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=%u;timing_port=%u",
+  evrtsp_add_header(req->output_headers, "Content-Type", "application/x-apple-binary-plist");
+
+  ret = req_setup1_payload_create(&data, &len, rs->timing_svc->port, rs->client_address);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create plist body for SETUP\n");
+      goto error;
+    }
+
+  evbuffer_add(req->output_buffer, (unsigned char *)data, len);
+
+  // Request UDP transport, AirTunes v2 streaming
+/*  ret = snprintf(hdr, sizeof(hdr), "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=%u;timing_port=%u",
 		 rs->control_svc->port, rs->timing_svc->port);
   if ((ret < 0) || (ret >= sizeof(hdr)))
     {
       DPRINTF(E_LOG, L_RAOP, "Transport header exceeds buffer length\n");
-
-      evrtsp_request_free(req);
-      return -1;
+      goto error;
     }
 
   evrtsp_add_header(req->output_headers, "Transport", hdr);
+*/
 
   ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_SETUP, rs->session_url);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not make SETUP request to '%s'\n", rs->devname);
-
-      return -1;
+      goto error;
     }
 
   rs->reqs_in_flight++;
 
   return 0;
+
+ error:
+  evrtsp_request_free(req);
+  return -1;
 }
 
+/*
 static int
 airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const char *log_caller)
 {
@@ -1503,7 +1892,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
 
   DPRINTF(E_DBG, L_RAOP, "%s: Sending ANNOUNCE to '%s'\n", log_caller, rs->devname);
 
-  /* Determine local address, needed for SDP and session URL */
+  // Determine local address, needed for SDP and session URL
   evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
   if (!address || (port == 0))
     {
@@ -1533,7 +1922,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
       return -1;
     }
 
-  /* Session ID and session URL */
+  // Session ID and session URL
   gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
 
   if (family == AF_INET)
@@ -1548,7 +1937,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
       goto cleanup_req;
     }
 
-  /* SDP payload */
+  // SDP payload
   ret = airplay_make_sdp(rs, req, address, family, session_id);
   free(address);
   if (ret < 0)
@@ -1567,7 +1956,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
 
   evrtsp_add_header(req->output_headers, "Content-Type", "application/sdp");
 
-  /* Challenge - but only if session is encrypted (important for ATV3 after update 6.0) */
+  // Challenge - but only if session is encrypted (important for ATV3 after update 6.0)
   if (rs->encrypt)
     {
       gcry_randomize(challenge, sizeof(challenge), GCRY_STRONG_RANDOM);
@@ -1579,7 +1968,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
 	  goto cleanup_req;
 	}
 
-      /* Remove base64 padding */
+      // Remove base64 padding
       ptr = strchr(challenge_b64, '=');
       if (ptr)
 	*ptr = '\0';
@@ -1606,6 +1995,7 @@ airplay_send_req_announce(struct airplay_session *rs, evrtsp_req_cb cb, const ch
 
   return -1;
 }
+*/
 
 /*
 The purpose of auth-setup is to authenticate the device and to exchange keys
@@ -1909,6 +2299,7 @@ session_free(struct airplay_session *rs)
 
   pair_cipher_free(rs->pair_cipher_ctx);
 
+  free(rs->client_address);
   free(rs->realm);
   free(rs->nonce);
   free(rs->session);
@@ -3622,12 +4013,12 @@ airplay_v2_stream_open(struct airplay_session *rs)
   switch (rs->sa.ss.ss_family)
     {
       case AF_INET:
-	rs->sa.sin.sin_port = htons(rs->server_port);
+	rs->sa.sin.sin_port = htons(rs->data_port);
 	len = sizeof(rs->sa.sin);
 	break;
 
       case AF_INET6:
-	rs->sa.sin6.sin6_port = htons(rs->server_port);
+	rs->sa.sin6.sin6_port = htons(rs->data_port);
 	len = sizeof(rs->sa.sin6);
 	break;
 
@@ -3639,7 +4030,7 @@ airplay_v2_stream_open(struct airplay_session *rs)
   ret = connect(rs->server_fd, &rs->sa.sa, len);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "connect() to [%s]:%u failed: %s\n", rs->address, rs->server_port, strerror(errno));
+      DPRINTF(E_LOG, L_RAOP, "connect() to [%s]:%u failed: %s\n", rs->address, rs->data_port, strerror(errno));
 
       goto out_fail;
     }
@@ -3656,45 +4047,53 @@ airplay_v2_stream_open(struct airplay_session *rs)
 }
 
 static void
-airplay_cb_startup_volume(struct evrtsp_request *req, void *arg)
+airplay_rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 {
   struct airplay_session *rs = arg;
+  uint8_t *out = NULL;
+  size_t out_len = 0;
   int ret;
 
-  rs->reqs_in_flight--;
+  uint8_t *in = evbuffer_pullup(evbuf, -1);
+  size_t in_len = evbuffer_get_length(evbuf);
 
-  if (!req)
-    goto cleanup;
-
-  if (req->response_code != RTSP_OK)
+  if (encrypt)
     {
-      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
-
-      goto cleanup;
+      DHEXDUMP(E_DBG, L_RAOP, in, in_len, "Encrypting outgoing request\n");
+      ret = pair_encrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
+    }
+  else
+    {
+      ret = pair_decrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
+      DHEXDUMP(E_DBG, L_RAOP, out, out_len, "Decrypted incoming response\n");
     }
 
-  ret = airplay_check_cseq(rs, req);
+  evbuffer_drain(evbuf, in_len);
+
   if (ret < 0)
-    goto cleanup;
+    {
+      DPRINTF(E_LOG, L_RAOP, "Error while ciphering: %s\n", pair_cipher_errmsg(rs->pair_cipher_ctx));
+      return;
+    }
 
-  ret = airplay_metadata_startup_send(rs);
-  if (ret < 0)
-    goto cleanup;
+  evbuffer_add(evbuf, out, out_len);
+}
 
-  ret = airplay_v2_stream_open(rs);
-  if (ret < 0)
-    goto cleanup;
+static int
+airplay_v2_event_open(struct airplay_session *rs)
+{
+  rs->event = evrtsp_connection_new(rs->address, rs->event_port);
+  if (!rs->event)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create event connection to '%s' (%s)\n", rs->devname, rs->address);
+      return -1;
+    }
 
-  /* Session startup and setup is done, tell our user */
-  airplay_status(rs);
+  evrtsp_connection_set_base(rs->event, evbase_player);
 
-  if (!rs->reqs_in_flight)
-    evrtsp_connection_set_closecb(rs->ctrl, airplay_rtsp_close_cb, rs);
+  evrtsp_connection_set_ciphercb(rs->event, airplay_rtsp_cipher, rs);
 
-  return;
-
- cleanup:
-  airplay_startup_cancel(rs);
+  return 0;
 }
 
 static void
@@ -3729,8 +4128,13 @@ airplay_cb_startup_record(struct evrtsp_request *req, void *arg)
 
   rs->state = RAOP_STATE_RECORD;
 
+//  ret = airplay_send_req_setpeers(rs, airplay_cb_startup_setpeers, "startup_record");
+//  if (ret < 0)
+//    goto cleanup;
+
+
   /* Set initial volume */
-  airplay_set_volume_internal(rs, rs->volume, airplay_cb_startup_volume);
+//  airplay_set_volume_internal(rs, rs->volume, airplay_cb_startup_volume);
 
   return;
 
@@ -3739,14 +4143,9 @@ airplay_cb_startup_record(struct evrtsp_request *req, void *arg)
 }
 
 static void
-airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
+airplay_cb_startup_setup2(struct evrtsp_request *req, void *arg)
 {
   struct airplay_session *rs = arg;
-  const char *param;
-  char *transport;
-  char *token;
-  char *ptr;
-  int tmp;
   int ret;
 
   rs->reqs_in_flight--;
@@ -3765,7 +4164,175 @@ airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
   if (ret < 0)
     goto cleanup;
 
-  /* Server-side session ID */
+  uint8_t *data = evbuffer_pullup(req->input_buffer, -1);
+  plist_t response;
+  plist_from_bin((char *)data, evbuffer_get_length(req->input_buffer), &response);
+  char *xml;
+  uint32_t xml_len;
+  plist_to_xml(response, &xml, &xml_len);
+
+  DPRINTF(E_LOG, L_RAOP, "Response from %s to request is %s\n", rs->devname, xml);
+
+  plist_t streams = plist_dict_get_item(response, "streams");
+  plist_t stream = plist_array_get_item(streams, 0);
+
+  uint64_t uintval;
+  plist_t tmp = plist_dict_get_item(stream, "dataPort");
+  if (tmp)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Found data port\n");
+      plist_get_uint_val(tmp, &uintval);
+      rs->data_port = uintval;
+    }
+  tmp = plist_dict_get_item(stream, "controlPort");
+  if (tmp)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Found control port\n");
+      plist_get_uint_val(tmp, &uintval);
+      rs->control_port = uintval;
+    }
+
+  DPRINTF(E_DBG, L_RAOP, "Negotiated AirTunes v2 UDP streaming session %s; ports d=%u c=%u t=%u e=%u\n", rs->session, rs->data_port, rs->control_port, rs->timing_port, rs->event_port);
+
+  ret = airplay_v2_stream_open(rs);
+  if (ret < 0)
+    goto cleanup;
+
+  rs->state = RAOP_STATE_SETUP;
+
+//  goto cleanup;
+
+  if (!rs->reqs_in_flight)
+    evrtsp_connection_set_closecb(rs->ctrl, airplay_rtsp_close_cb, rs);
+
+  ret = airplay_send_req_record(rs, airplay_cb_startup_record, "startup_setup2");
+  if (ret < 0)
+    goto cleanup;
+
+  /* Session startup and setup is done, tell our user */
+  airplay_status(rs);
+
+  return;
+
+ cleanup:
+  airplay_startup_cancel(rs);
+}
+
+static void
+airplay_cb_startup_volume(struct evrtsp_request *req, void *arg)
+{
+  struct airplay_session *rs = arg;
+  int ret;
+
+  rs->reqs_in_flight--;
+
+  if (!req)
+    goto cleanup;
+
+  if (req->response_code != RTSP_OK)
+    {
+      DPRINTF(E_LOG, L_RAOP, "SET_PARAMETER request failed for startup volume: %d %s\n", req->response_code, req->response_code_line);
+
+      goto cleanup;
+    }
+
+  ret = airplay_check_cseq(rs, req);
+  if (ret < 0)
+    goto cleanup;
+
+  ret = airplay_metadata_startup_send(rs);
+  if (ret < 0)
+    goto cleanup;
+
+  ret = airplay_send_req_setup2(rs, airplay_cb_startup_setup2, "startup_volume");
+  if (ret < 0)
+    goto cleanup;
+
+  return;
+
+ cleanup:
+  airplay_startup_cancel(rs);
+}
+
+static void
+airplay_cb_startup_setpeers(struct evrtsp_request *req, void *arg)
+{
+  struct airplay_session *rs = arg;
+  int ret;
+
+  rs->reqs_in_flight--;
+
+  if (!req)
+    goto cleanup;
+
+  if (req->response_code != RTSP_OK)
+    {
+      DPRINTF(E_LOG, L_RAOP, "SETPEERS request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+
+      goto cleanup;
+    }
+
+  ret = airplay_check_cseq(rs, req);
+  if (ret < 0)
+    goto cleanup;
+
+  airplay_set_volume_internal(rs, rs->volume, airplay_cb_startup_volume);
+
+  return;
+
+ cleanup:
+  airplay_startup_cancel(rs);
+}
+
+static void
+airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
+{
+  struct airplay_session *rs = arg;
+  int ret;
+
+  rs->reqs_in_flight--;
+
+  if (!req)
+    goto cleanup;
+
+  if (req->response_code != RTSP_OK)
+    {
+      DPRINTF(E_LOG, L_RAOP, "SETUP request failed in session startup: %d %s\n", req->response_code, req->response_code_line);
+
+      goto cleanup;
+    }
+
+  ret = airplay_check_cseq(rs, req);
+  if (ret < 0)
+    goto cleanup;
+
+  uint8_t *data = evbuffer_pullup(req->input_buffer, -1);
+  plist_t response;
+  plist_from_bin((char *)data, evbuffer_get_length(req->input_buffer), &response);
+  char *xml;
+  uint32_t xml_len;
+  plist_to_xml(response, &xml, &xml_len);
+
+  DPRINTF(E_LOG, L_RAOP, "Response from %s to request is %s\n", rs->devname, xml);
+
+  uint64_t uintval;
+  plist_t tmp = plist_dict_get_item(response, "eventPort");
+  if (tmp)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Found event port\n");
+      plist_get_uint_val(tmp, &uintval);
+      rs->event_port = uintval;
+    }
+
+  tmp = plist_dict_get_item(response, "timingPort");
+  if (tmp)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Found timing port\n");
+      plist_get_uint_val(tmp, &uintval);
+      rs->timing_port = uintval;
+    }
+
+/*
   param = evrtsp_find_header(req->input_headers, "Session");
   if (!param)
     {
@@ -3776,7 +4343,6 @@ airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
 
   rs->session = strdup(param);
 
-  /* Check transport and get remote streaming port */
   param = evrtsp_find_header(req->input_headers, "Transport");
   if (!param)
     {
@@ -3785,7 +4351,6 @@ airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
       goto cleanup;
     }
 
-  /* Check transport is really UDP, AirTunes v2 streaming */
   if (strncmp(param, "RTP/AVP/UDP;", strlen("RTP/AVP/UDP;")) != 0)
     {
       DPRINTF(E_LOG, L_RAOP, "ApEx replied with unsupported Transport: %s\n", param);
@@ -3862,21 +4427,21 @@ airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
     }
 
   free(transport);
+*/
 
-  if ((rs->server_port == 0) || (rs->control_port == 0))
+  if (rs->event_port == 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Transport header lacked some port numbers in SETUP reply\n");
-      DPRINTF(E_LOG, L_RAOP, "Transport header was: %s\n", param);
+      DPRINTF(E_LOG, L_RAOP, "SETUP reply is missing event port\n");
 
       goto cleanup;
     }
 
-  DPRINTF(E_DBG, L_RAOP, "Negotiated AirTunes v2 UDP streaming session %s; ports s=%u c=%u t=%u\n", rs->session, rs->server_port, rs->control_port, rs->timing_port);
+  ret = airplay_v2_event_open(rs);
+  if (ret < 0)
+    goto cleanup;
 
-  rs->state = RAOP_STATE_SETUP;
-
-  /* Send RECORD */
-  ret = airplay_send_req_record(rs, airplay_cb_startup_record, "startup_setup");
+//  ret = airplay_send_req_record(rs, airplay_cb_startup_record, "startup_setup");
+  ret = airplay_send_req_setpeers(rs, airplay_cb_startup_setpeers, "startup_setup");
   if (ret < 0)
     goto cleanup;
 
@@ -3886,6 +4451,7 @@ airplay_cb_startup_setup(struct evrtsp_request *req, void *arg)
   airplay_startup_cancel(rs);
 }
 
+/*
 static void
 airplay_cb_startup_announce(struct evrtsp_request *req, void *arg)
 {
@@ -3910,7 +4476,7 @@ airplay_cb_startup_announce(struct evrtsp_request *req, void *arg)
 
   rs->state = RAOP_STATE_ANNOUNCE;
 
-  /* Send SETUP */
+  // Send SETUP
   ret = airplay_send_req_setup(rs, airplay_cb_startup_setup, "startup_announce");
   if (ret < 0)
     goto cleanup;
@@ -3920,6 +4486,7 @@ airplay_cb_startup_announce(struct evrtsp_request *req, void *arg)
  cleanup:
   airplay_startup_cancel(rs);
 }
+*/
 
 static void
 airplay_cb_startup_auth_setup(struct evrtsp_request *req, void *arg)
@@ -3936,7 +4503,7 @@ airplay_cb_startup_auth_setup(struct evrtsp_request *req, void *arg)
     DPRINTF(E_WARN, L_RAOP, "Unexpected reply to auth-setup from '%s', proceeding anyway (%d %s)\n", rs->devname, req->response_code, req->response_code_line);
 
   // Send ANNOUNCE
-  ret = airplay_send_req_announce(rs, airplay_cb_startup_announce, "startup_auth_setup");
+  ret = airplay_send_req_setup(rs, airplay_cb_startup_setup, "startup_auth_setup");
   if (ret < 0)
     goto cleanup;
 
@@ -4041,8 +4608,7 @@ airplay_cb_startup_options(struct evrtsp_request *req, void *arg)
     }
   else
     {
-      // Send ANNOUNCE
-      ret = airplay_send_req_announce(rs, airplay_cb_startup_announce, "startup_options");
+      ret = airplay_send_req_setup(rs, airplay_cb_startup_setup, "startup_options");
       if (ret < 0)
 	goto cleanup;
     }
@@ -4207,33 +4773,6 @@ airplay_pair_request_send(int step, struct airplay_session *rs, void (*cb)(struc
   evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
 
   return 0;
-}
-
-static void
-airplay_rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
-{
-  struct airplay_session *rs = arg;
-  uint8_t *out = NULL;
-  size_t out_len = 0;
-  int ret;
-
-  uint8_t *in = evbuffer_pullup(evbuf, -1);
-  size_t in_len = evbuffer_get_length(evbuf);
-
-  if (encrypt)
-    ret = pair_encrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
-  else
-    ret = pair_decrypt(&out, &out_len, in, in_len, rs->pair_cipher_ctx);
-
-  evbuffer_drain(evbuf, in_len);
-
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Error while ciphering: %s\n", pair_cipher_errmsg(rs->pair_cipher_ctx));
-      return;
-    }
-
-  evbuffer_add(evbuf, out, out_len);
 }
 
 static void
@@ -4639,8 +5178,9 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
   if (!keyval_get(&features, "SupportsAirPlayAudio"))
     goto free_rd;
 
-  if (keyval_get(&features, "MetadataFeatures_0"))
-    re->wanted_metadata |= RAOP_MD_WANTS_ARTWORK;
+// Disable artwork while debugging
+//  if (keyval_get(&features, "MetadataFeatures_0"))
+//    re->wanted_metadata |= RAOP_MD_WANTS_ARTWORK;
   if (keyval_get(&features, "MetadataFeatures_1"))
     re->wanted_metadata |= RAOP_MD_WANTS_PROGRESS;
   if (keyval_get(&features, "MetadataFeatures_2"))
