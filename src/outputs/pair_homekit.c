@@ -1,4 +1,10 @@
 /*
+ * Adaption of ap2-sender by ViktoriiaKh:
+ *    <https://github.com/ViktoriiaKh/ap2-sender>
+ *
+ * To test, it is useful to try with this receiver:
+ *    <https://github.com/Argyropus/airplay2-receiver>
+ *
  * The Secure Remote Password 6a implementation is adapted from:
  *  - Tom Cocagne
  *    <https://github.com/cocagne/csrp>
@@ -7,17 +13,17 @@
  *    <https://github.com/maximkulkin/esp-homekit>
  *
  * The MIT License (MIT)
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
  * this software and associated documentation files (the "Software"), to deal in
  * the Software without restriction, including without limitation the rights to
  * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
  * of the Software, and to permit persons to whom the Software is furnished to do
  * so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in all
  * copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -25,7 +31,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- * 
+ *
  */
 
 #include <stdio.h>
@@ -124,25 +130,25 @@ struct SRPUser
 {
   enum hash_alg     alg;
   NGConstant        *ng;
-    
+
   bnum a;
   bnum A;
   bnum S;
 
   const unsigned char *bytes_A;
   int           authenticated;
-    
+
   char          *username;
   unsigned char *password;
   int           password_len;
-    
+
   unsigned char M           [SHA512_DIGEST_LENGTH];
   unsigned char H_AMK       [SHA512_DIGEST_LENGTH];
   unsigned char session_key [SHA512_DIGEST_LENGTH];
   int           session_key_len;
 };
 
-struct NGHex 
+struct NGHex
 {
   const char *n_hex;
   const char *g_hex;
@@ -189,10 +195,10 @@ new_ng(SRP_NGType ng_type, const char *n_hex, const char *g_hex)
       n_hex = global_Ng_constants[ ng_type ].n_hex;
       g_hex = global_Ng_constants[ ng_type ].g_hex;
     }
-        
+
   bnum_hex2bn(ng->N, n_hex);
   bnum_hex2bn(ng->g, g_hex);
-    
+
   return ng;
 }
 
@@ -218,7 +224,7 @@ calculate_x(enum hash_alg alg, const bnum salt, const char *username, const unsi
   hash_update( alg, &ctx, ":", 1 );
   hash_update( alg, &ctx, password, password_len );
   hash_final( alg, &ctx, ucp_hash );
-        
+
   return H_ns( alg, salt, ucp_hash, hash_length(alg) );
 }
 
@@ -233,24 +239,24 @@ calculate_M(enum hash_alg alg, NGConstant *ng, unsigned char *dest, const char *
   HashCTX       ctx;
   int           i = 0;
   int           hash_len = hash_length(alg);
-        
+
   hash_num( alg, ng->N, H_N );
   hash_num( alg, ng->g, H_g );
-    
+
   hash(alg, (const unsigned char *)I, strlen(I), H_I);
-    
+
   for (i=0; i < hash_len; i++ )
     H_xor[i] = H_N[i] ^ H_g[i];
     
   hash_init( alg, &ctx );
-    
+
   hash_update( alg, &ctx, H_xor, hash_len );
   hash_update( alg, &ctx, H_I,   hash_len );
   update_hash_n( alg, &ctx, s );
   update_hash_n( alg, &ctx, A );
   update_hash_n( alg, &ctx, B );
   hash_update( alg, &ctx, K, K_len );
-    
+
   hash_final( alg, &ctx, dest );
 }
 
@@ -258,18 +264,18 @@ static void
 calculate_H_AMK(enum hash_alg alg, unsigned char *dest, const bnum A, const unsigned char * M, const unsigned char * K, int K_len)
 {
   HashCTX ctx;
-    
+
   hash_init( alg, &ctx );
-    
+
   update_hash_n( alg, &ctx, A );
   hash_update( alg, &ctx, M, hash_length(alg) );
   hash_update( alg, &ctx, K, K_len );
-    
+
   hash_final( alg, &ctx, dest );
 }
 
 static struct SRPUser *
-srp_user_new(enum hash_alg alg, SRP_NGType ng_type, const char *username, 
+srp_user_new(enum hash_alg alg, SRP_NGType ng_type, const char *username,
              const unsigned char *bytes_password, int len_password,
              const char *n_hex, const char *g_hex)
 {
@@ -281,27 +287,27 @@ srp_user_new(enum hash_alg alg, SRP_NGType ng_type, const char *username,
 
   usr->alg = alg;
   usr->ng  = new_ng( ng_type, n_hex, g_hex );
-    
+
   bnum_new(usr->a);
   bnum_new(usr->A);
   bnum_new(usr->S);
 
   if (!usr->ng || !usr->a || !usr->A || !usr->S)
     goto err_exit;
-    
+
   usr->username     = malloc(ulen);
   usr->password     = malloc(len_password);
   usr->password_len = len_password;
 
   if (!usr->username || !usr->password)
     goto err_exit;
-    
+
   memcpy(usr->username, username,       ulen);
   memcpy(usr->password, bytes_password, len_password);
 
   usr->authenticated = 0;
   usr->bytes_A = 0;
-    
+
   return usr;
 
  err_exit:
@@ -379,9 +385,9 @@ srp_user_start_authentication(struct SRPUser *usr, const char **username,
       *username = 0;
       return;
     }
-        
+
   bnum_bn2bin(usr->A, (unsigned char *) *bytes_A, *len_A);
-    
+
   usr->bytes_A = *bytes_A;
   *username = usr->username;
 }
@@ -420,7 +426,7 @@ srp_user_process_challenge(struct SRPUser *usr, const unsigned char *bytes_s, in
   if (!bnum_is_zero(B) && !bnum_is_zero(u))
     {
       bnum_modexp(v, usr->ng->g, x, usr->ng->N);
-        
+
       // S = (B - k*(g^x)) ^ (a + ux)
       bnum_mul(tmp1, u, x);
       bnum_add(tmp2, usr->a, tmp1);        // tmp2 = (a + ux)
@@ -434,7 +440,7 @@ srp_user_process_challenge(struct SRPUser *usr, const unsigned char *bytes_s, in
 
       calculate_M(usr->alg, usr->ng, usr->M, usr->username, s, usr->A, B, usr->session_key, usr->session_key_len);
       calculate_H_AMK(usr->alg, usr->H_AMK, usr->A, usr->M, usr->session_key, usr->session_key_len);
-        
+
       *bytes_M = usr->M;
       if (len_M)
         *len_M = hash_length(usr->alg);
@@ -442,7 +448,7 @@ srp_user_process_challenge(struct SRPUser *usr, const unsigned char *bytes_s, in
   else
     {
       *bytes_M = NULL;
-      if (len_M) 
+      if (len_M)
         *len_M   = 0;
     }
 
@@ -921,7 +927,7 @@ decrypt_chacha(uint8_t *plain, uint8_t *cipher, size_t cipher_len, const uint8_t
     goto error;
 
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, tag_len, tag) != 1)
-    goto error; // TODO seems we don't actually check it by doing this
+    goto error;
 
   if (EVP_DecryptUpdate(ctx, NULL, &len, ad, ad_len) != 1)
     goto error;
@@ -1059,11 +1065,19 @@ pair_setup_request1(uint32_t *len, struct pair_setup_context *sctx)
   uint8_t *data;
   size_t data_len;
   uint8_t method;
+  int endian_test = 1;
   int ret;
 
   data_len = REQUEST_BUFSIZE;
   data = malloc(data_len);
   request = tlv_new();
+
+  // Test here instead of setup_new() so we can give an error message
+  if(*(char *)&endian_test != 1)
+    {
+      sctx->errmsg = "Setup request 1: No support for big endian architechture";
+      goto error;
+    }
 
   sctx->user = srp_user_new(HASH_SHA512, SRP_NG_3072, USERNAME, (unsigned char *)sctx->pin, sizeof(sctx->pin), 0, 0);
   if (!sctx->user)
@@ -1470,7 +1484,7 @@ pair_verify_request2(uint32_t *len, struct pair_verify_context *vctx)
       vctx->errmsg = "Verify request 2: hkdf error getting derived_key";
       goto error;
     }
-    
+
   memcpy(nonce + 4, pair_keys_map[PAIR_VERIFY_MSG03].nonce, NONCE_LENGTH - 4);
 
   encrypted_data_len = data_len + sizeof(tag); // Space for ciphered payload and authtag
