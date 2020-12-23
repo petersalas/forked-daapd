@@ -267,7 +267,6 @@ enum airplay_seq_type
   AIRPLAY_SEQ_START,
   AIRPLAY_SEQ_START_RERUN,
   AIRPLAY_SEQ_START_AP2,
-  AIRPLAY_SEQ_START_AP2_WITH_AUTH,
   AIRPLAY_SEQ_PROBE,
   AIRPLAY_SEQ_FLUSH,
   AIRPLAY_SEQ_STOP,
@@ -2866,6 +2865,9 @@ Since we don't do auth or encryption, we currently just ignore the reponse.
 static int
 payload_make_auth_setup(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
+  if (!(rs->supports_post && rs->supports_auth_setup))
+    return 1; // skip this request
+
   // Flag for no encryption. 0x10 may mean encryption.
   evbuffer_add(req->output_buffer, "\x01", 1);
 
@@ -3329,10 +3331,6 @@ response_handler_options_start(struct evrtsp_request *req, struct airplay_sessio
   if (seq_type != AIRPLAY_SEQ_CONTINUE)
     return seq_type;
 
-  // Airplay 2 MFi devices (?) require this step
-  if (rs->supports_post && rs->supports_auth_setup)
-    return AIRPLAY_SEQ_START_AP2_WITH_AUTH;
-
   return AIRPLAY_SEQ_START_AP2;
 }
 
@@ -3546,7 +3544,6 @@ static struct airplay_seq_definition airplay_seq_definition[] =
   { AIRPLAY_SEQ_START, NULL, start_retry },
   { AIRPLAY_SEQ_START_RERUN, NULL, start_retry },
   { AIRPLAY_SEQ_START_AP2, session_connected, start_failure },
-  { AIRPLAY_SEQ_START_AP2_WITH_AUTH, session_connected, start_failure },
   { AIRPLAY_SEQ_PROBE, session_success, session_failure },
   { AIRPLAY_SEQ_FLUSH, session_status, session_failure },
   { AIRPLAY_SEQ_STOP, session_success, session_failure },
@@ -3575,15 +3572,12 @@ static struct airplay_seq_request airplay_seq_request[][7] =
     { AIRPLAY_SEQ_START_RERUN, "OPTIONS (re-run)", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_start, NULL, "*", false },
   },
   {
+    { AIRPLAY_SEQ_START_AP2, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
     { AIRPLAY_SEQ_START_AP2, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
     { AIRPLAY_SEQ_START_AP2, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
-  },
-  {
-    { AIRPLAY_SEQ_START_AP2_WITH_AUTH, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
-// TODO copy AIRPLAY2
   },
   {
     // Proceed on error is true because we want to delete the device key in the response handler if the verification fails
@@ -3704,8 +3698,6 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
   const char *uri;
   int ret;
 
-  DPRINTF(E_DBG, L_RAOP, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, rs->devname);
-
   req = evrtsp_request_new(sequence_continue_cb, seq_ctx);
   if (!req)
     goto error;
@@ -3720,11 +3712,26 @@ sequence_continue(struct airplay_seq_ctx *seq_ctx)
   if (cur_request->payload_make)
     {
       ret = cur_request->payload_make(req, rs, seq_ctx->payload_make_arg);
-      if (ret < 0)
+      if (ret > 0) // Skip to next request in sequence, if none -> error
+        {
+	  seq_ctx->cur_request++;
+	  if (!seq_ctx->cur_request->name)
+	    {
+	      DPRINTF(E_LOG, L_RAOP, "Bug! payload_make signaled skip request, but there is nothing to skip to\n");
+	      goto error;
+	    }
+
+	  evrtsp_request_free(req);
+	  sequence_continue(seq_ctx);
+	  return;
+        }
+      else if (ret < 0)
 	goto error;
     }
 
   uri = (cur_request->uri) ? cur_request->uri : rs->session_url;
+
+  DPRINTF(E_DBG, L_RAOP, "%s: Sending %s to '%s'\n", seq_ctx->log_caller, cur_request->name, rs->devname);
 
   ret = evrtsp_make_request(rs->ctrl, req, cur_request->rtsp_type, uri);
   if (ret < 0)
