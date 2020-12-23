@@ -59,6 +59,11 @@
 
 #include "pair.h"
 
+// Airplay 2 has a gazallion parameters, many of them unknown to us. With the
+// below it is possible to easily try different variations.
+#define AIRPLAY_USE_STREAMID                 0
+
+
 #define ALAC_HEADER_LEN                      3
 
 #define RAOP_QUALITY_SAMPLE_RATE_DEFAULT     44100
@@ -851,6 +856,10 @@ request_headers_add(struct evrtsp_request *req, struct airplay_session *rs, enum
   if (rs->session)
     evrtsp_add_header(req->output_headers, "Session", rs->session);
 
+#if AIRPLAY_USE_STREAMID
+  evrtsp_add_header(req->output_headers, "X-Apple-StreamID", "1");
+#endif
+
   /* Content-Length added automatically by evrtsp */
 
   return 0;
@@ -998,6 +1007,7 @@ rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 
   if (ret < 0)
     {
+// TODO test this error condition seems that it can lead to a freeze
       DPRINTF(E_LOG, L_RAOP, "Error while ciphering: %s\n", pair_cipher_errmsg(rs->control_cipher_ctx));
       return;
     }
@@ -3166,12 +3176,13 @@ response_handler_setup_stream(struct evrtsp_request *req, struct airplay_session
   rs->events_fd = device_connect(rs, rs->events_port, SOCK_STREAM);
   if (rs->events_fd < 0)
     {
-      DPRINTF(E_WARN, L_RAOP, "Could not connect to event port\n");
-      goto error;
+      DPRINTF(E_WARN, L_RAOP, "Could not connect to '%s' events port %u, proceeding anyway\n", rs->devname, rs->events_port);
     }
-
-  struct event *ev = event_new(evbase_player, rs->events_fd, EV_READ | EV_PERSIST, event_channel_cb, rs); // TODO, possibly use evrtsp instead
-  event_add(ev, NULL);
+  else
+    {
+      struct event *ev = event_new(evbase_player, rs->events_fd, EV_READ | EV_PERSIST, event_channel_cb, rs); // TODO, possibly use evrtsp instead
+      event_add(ev, NULL);
+    }
 
   rs->state = AIRPLAY_STATE_SETUP;
 
