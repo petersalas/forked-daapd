@@ -278,6 +278,7 @@ enum airplay_seq_type
   AIRPLAY_SEQ_SEND_PROGRESS,
   AIRPLAY_SEQ_SEND_ARTWORK,
   AIRPLAY_SEQ_PAIR_SETUP,
+  AIRPLAY_SEQ_FEEDBACK,
   AIRPLAY_SEQ_CONTINUE, // Must be last element
 };
 
@@ -1529,15 +1530,10 @@ airplay_metadata_startup_send(struct airplay_session *rs)
   return airplay_metadata_send_generic(rs, airplay_cur_metadata, false);
 }
 
-static int
+static void
 airplay_metadata_keep_alive_send(struct airplay_session *rs)
 {
-  if (!rs->wanted_metadata || !airplay_cur_metadata)
-    return 0;
-
-  airplay_cur_metadata->startup = false;
-
-  return airplay_metadata_send_generic(rs, airplay_cur_metadata, true);
+  sequence_start(AIRPLAY_SEQ_FEEDBACK, rs, NULL, "keep_alive");
 }
 
 static void
@@ -3561,6 +3557,7 @@ static struct airplay_seq_definition airplay_seq_definition[] =
   { AIRPLAY_SEQ_SEND_PROGRESS, NULL, session_failure },
   { AIRPLAY_SEQ_SEND_ARTWORK, NULL, session_failure },
   { AIRPLAY_SEQ_PAIR_SETUP, session_success, session_failure },
+  { AIRPLAY_SEQ_FEEDBACK, NULL, session_failure },
 };
 
 // The size of the second array dimension MUST at least be the size of largest
@@ -3622,6 +3619,9 @@ static struct airplay_seq_request airplay_seq_request[][7] =
     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", false },
     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 2", EVRTSP_REQ_POST, payload_make_pair_setup2, response_handler_pair_setup2, "application/octet-stream", "/pair-setup", false },
     { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 3", EVRTSP_REQ_POST, payload_make_pair_setup3, response_handler_pair_setup3, "application/octet-stream", "/pair-setup", false },
+  },
+  {
+    { AIRPLAY_SEQ_FEEDBACK, "POST /feedback", EVRTSP_REQ_POST, NULL, NULL, NULL, "/feedback", true },
   },
 };
 
