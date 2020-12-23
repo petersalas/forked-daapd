@@ -62,9 +62,7 @@
 #include "rtp_common.h"
 #include "outputs.h"
 
-#ifdef RAOP_VERIFICATION
 #include "pair.h"
-#endif
 
 #define ALAC_HEADER_LEN                      3
 
@@ -221,7 +219,6 @@ struct airplay_session
   unsigned short events_port;
   unsigned short timing_port; // ATV4 has this set to 0, but it is not used by forked-daapd anyway
 
-#ifdef RAOP_VERIFICATION
   /* Homekit pairing, see pair.h */
   struct pair_cipher_context *control_cipher_ctx;
   struct pair_cipher_context *events_cipher_ctx;
@@ -229,7 +226,6 @@ struct airplay_session
   struct pair_setup_context *pair_setup_ctx;
 
   uint8_t shared_secret[32];
-#endif
 
   int server_fd;
   int events_fd;
@@ -286,6 +282,7 @@ enum airplay_seq_type
   AIRPLAY_SEQ_SEND_TEXT,
   AIRPLAY_SEQ_SEND_PROGRESS,
   AIRPLAY_SEQ_SEND_ARTWORK,
+  AIRPLAY_SEQ_PAIR_SETUP,
   AIRPLAY_SEQ_CONTINUE, // Must be last element
 };
 
@@ -1533,7 +1530,10 @@ session_free(struct airplay_session *rs)
   if (rs->server_fd >= 0)
     close(rs->server_fd);
 
+  pair_setup_free(rs->pair_setup_ctx);
+  pair_verify_free(rs->pair_verify_ctx);
   pair_cipher_free(rs->control_cipher_ctx);
+  pair_cipher_free(rs->events_cipher_ctx);
 
   free(rs->local_address);
   free(rs->realm);
@@ -3244,21 +3244,115 @@ payload_make_auth_setup(struct evrtsp_request *req, struct airplay_session *rs, 
   return 0;
 }
 
-#ifdef RAOP_VERIFICATION
 static int
 payload_make_pin_start(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
   DPRINTF(E_LOG, L_RAOP, "Starting device verification for '%s', go to the web interface and enter PIN\n", rs->devname);
   return 0;
 }
-#else
+
 static int
-payload_make_pin_start(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+payload_make_pair_generic(int step, struct evrtsp_request *req, struct airplay_session *rs)
 {
-  DPRINTF(E_LOG, L_RAOP, "Device '%s' requires verification, but forked-daapd was built with --disable-verification\n", rs->devname);
-  return -1;
+  uint8_t *body;
+  uint32_t len;
+  const char *errmsg;
+
+  switch (step)
+    {
+      case 1:
+	body    = pair_setup_request1(&len, rs->pair_setup_ctx);
+	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 2:
+	body    = pair_setup_request2(&len, rs->pair_setup_ctx);
+	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 3:
+	body    = pair_setup_request3(&len, rs->pair_setup_ctx);
+	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 4:
+	body    = pair_verify_request1(&len, rs->pair_verify_ctx);
+	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
+	break;
+      case 5:
+	body    = pair_verify_request2(&len, rs->pair_verify_ctx);
+	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
+	break;
+      default:
+	body    = NULL;
+	errmsg  = "Bug! Bad step number";
+    }
+
+  if (!body)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Verification step %d request error: %s\n", step, errmsg);
+      return -1;
+    }
+
+  evbuffer_add(req->output_buffer, body, len);
+  free(body);
+
+  // Required, probably sets Homekit Pairing to version 3?
+  evrtsp_add_header(req->output_headers, "X-Apple-HKP", "3"); // Required!!
+
+  return 0;
 }
-#endif
+
+static int
+payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+{
+  char *pin = arg;
+
+  rs->pair_setup_ctx = pair_setup_new(PAIR_HOMEKIT, pin, pair_device_id);
+  if (!rs->pair_setup_ctx)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Out of memory for verification setup context\n");
+      return -1;
+    }
+
+  rs->state = AIRPLAY_STATE_PASSWORD;
+
+  return payload_make_pair_generic(1, req, rs);
+}
+
+static int
+payload_make_pair_setup2(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+{
+  return payload_make_pair_generic(2, req, rs);
+}
+
+static int
+payload_make_pair_setup3(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+{
+  return payload_make_pair_generic(3, req, rs);
+}
+
+static int
+payload_make_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+{
+  struct output_device *device;
+
+  device = outputs_device_get(rs->device_id);
+  if (!device)
+    return -1;
+
+  rs->pair_verify_ctx = pair_verify_new(PAIR_HOMEKIT, device->auth_key, pair_device_id);
+  if (!rs->pair_verify_ctx)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Out of memory for verification verify context\n");
+      return -1;
+    }
+
+  return payload_make_pair_generic(4, req, rs);
+}
+
+static int
+payload_make_pair_verify2(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
+{
+  return payload_make_pair_generic(5, req, rs);
+}
 
 
 /* ------------------------------ Session startup --------------------------- */
@@ -3614,6 +3708,181 @@ response_handler_options_start(struct evrtsp_request *req, struct airplay_sessio
   return AIRPLAY_SEQ_START_AP2;
 }
 
+static enum airplay_seq_type
+response_handler_pair_generic(int step, struct evrtsp_request *req, struct airplay_session *rs)
+{
+  uint8_t *response;
+  const char *errmsg;
+  size_t len;
+  int ret;
+
+  response = evbuffer_pullup(req->input_buffer, -1);
+  len = evbuffer_get_length(req->input_buffer);
+
+  switch (step)
+    {
+      case 1:
+	ret = pair_setup_response1(rs->pair_setup_ctx, response, len);
+	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 2:
+	ret = pair_setup_response2(rs->pair_setup_ctx, response, len);
+	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 3:
+	ret = pair_setup_response3(rs->pair_setup_ctx, response, len);
+	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
+	break;
+      case 4:
+	ret = pair_verify_response1(rs->pair_verify_ctx, response, len);
+	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
+	break;
+      case 5:
+	ret = pair_verify_response2(rs->pair_verify_ctx, response, len);
+	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
+	break;
+      default:
+	ret = -1;
+	errmsg = "Bug! Bad step number";
+    }
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Verification step %d response from '%s' error: %s\n", step, rs->devname, errmsg);
+      return AIRPLAY_SEQ_ABORT;
+    }
+
+  return AIRPLAY_SEQ_CONTINUE;
+}
+
+static enum airplay_seq_type
+response_handler_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  return response_handler_pair_generic(1, req, rs);
+}
+
+static enum airplay_seq_type
+response_handler_pair_setup2(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  return response_handler_pair_generic(2, req, rs);
+}
+
+static enum airplay_seq_type
+response_handler_pair_setup3(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  struct output_device *device;
+  const char *authorization_key;
+  enum airplay_seq_type seq_type;
+  int ret;
+
+  seq_type = response_handler_pair_generic(3, req, rs);
+  if (seq_type != AIRPLAY_SEQ_CONTINUE)
+    return seq_type;
+
+  ret = pair_setup_result(&authorization_key, rs->pair_setup_ctx);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Verification setup result error: %s\n", pair_setup_errmsg(rs->pair_setup_ctx));
+      return AIRPLAY_SEQ_ABORT;
+    }
+
+  DPRINTF(E_LOG, L_RAOP, "Verification setup stage complete, saving authorization key\n");
+
+  device = outputs_device_get(rs->device_id);
+  if (!device)
+    return AIRPLAY_SEQ_ABORT;
+
+  free(device->auth_key);
+  device->auth_key = strdup(authorization_key);
+
+  // A blocking db call... :-~
+  db_speaker_save(device);
+
+  // No longer AIRPLAY_STATE_PASSWORD
+  rs->state = AIRPLAY_STATE_STOPPED;
+
+  return AIRPLAY_SEQ_CONTINUE;
+}
+
+static enum airplay_seq_type
+response_handler_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  struct output_device *device;
+  enum airplay_seq_type seq_type;
+
+  seq_type = response_handler_pair_generic(4, req, rs);
+  if (seq_type != AIRPLAY_SEQ_CONTINUE)
+    {
+      rs->state = AIRPLAY_STATE_PASSWORD;
+
+      device = outputs_device_get(rs->device_id);
+      if (!device)
+	return AIRPLAY_SEQ_ABORT;
+
+      // Clear auth_key, the device did not accept it
+      free(device->auth_key);
+      device->auth_key = NULL;
+
+      return AIRPLAY_SEQ_ABORT;
+    }
+
+  return seq_type;
+}
+
+static enum airplay_seq_type
+response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  struct output_device *device;
+  enum airplay_seq_type seq_type;
+  int ret;
+
+  seq_type = response_handler_pair_generic(5, req, rs);
+  if (seq_type != AIRPLAY_SEQ_CONTINUE)
+    goto error;
+
+  ret = pair_verify_result(rs->shared_secret, sizeof(rs->shared_secret), rs->pair_verify_ctx);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Verification verify result error: %s\n", pair_verify_errmsg(rs->pair_verify_ctx));
+      goto error;
+    }
+
+  rs->control_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 0, rs->shared_secret, sizeof(rs->shared_secret));
+  if (!rs->control_cipher_ctx)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create control ciphering context\n");
+      goto error;
+    }
+
+  rs->events_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 1, rs->shared_secret, sizeof(rs->shared_secret));
+  if (!rs->events_cipher_ctx)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Could not create events ciphering context\n");
+      goto error;
+    }
+
+  evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
+
+  DPRINTF(E_INFO, L_RAOP, "Verification of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
+
+  rs->state = AIRPLAY_STATE_STARTUP;
+
+  return AIRPLAY_SEQ_CONTINUE;
+
+ error:
+  device = outputs_device_get(rs->device_id);
+  if (!device)
+    return AIRPLAY_SEQ_ABORT;
+
+  // Clear auth_key, the device did not accept it, or some other unexpected error
+  free(device->auth_key);
+  device->auth_key = NULL;
+
+  rs->state = AIRPLAY_STATE_PASSWORD;
+
+  return AIRPLAY_SEQ_ABORT;
+}
+
 
 /* ---------------------- Request/response sequence control ----------------- */
 
@@ -3659,14 +3928,18 @@ static struct airplay_seq_definition airplay_seq_definition[] =
   { AIRPLAY_SEQ_SEND_TEXT, NULL, session_failure },
   { AIRPLAY_SEQ_SEND_PROGRESS, NULL, session_failure },
   { AIRPLAY_SEQ_SEND_ARTWORK, NULL, session_failure },
+  { AIRPLAY_SEQ_PAIR_SETUP, session_success, session_failure },
 };
 
 // The size of the second array dimension MUST at least be the size of largest
 // sequence + 1, because then we can count on a zero terminator when iterating
 static struct airplay_seq_request airplay_seq_request[][7] = 
 {
-  // response_handler_options() will determine appropriate sequence to continue with based on device response
   {
+    // Proceed on error is true because we want to delete the device key in the response handler if the verification fails
+    { AIRPLAY_SEQ_START, "pair verify 1", EVRTSP_REQ_POST, payload_make_pair_verify1, response_handler_pair_verify1, "application/octet-stream", "/pair-verify", true },
+    { AIRPLAY_SEQ_START, "pair verify 2", EVRTSP_REQ_POST, payload_make_pair_verify2, response_handler_pair_verify2, "application/octet-stream", "/pair-verify", false },
+    // response_handler_options() will determine appropriate sequence to continue with based on device response
     { AIRPLAY_SEQ_START, "OPTIONS", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_start, NULL, "*", true },
   },
   {
@@ -3684,6 +3957,9 @@ static struct airplay_seq_request airplay_seq_request[][7] =
 // TODO copy AIRPLAY2
   },
   {
+    // Proceed on error is true because we want to delete the device key in the response handler if the verification fails
+    { AIRPLAY_SEQ_PROBE, "pair verify 1", EVRTSP_REQ_POST, payload_make_pair_verify1, response_handler_pair_verify1, "application/octet-stream", "/pair-verify", true },
+    { AIRPLAY_SEQ_PROBE, "pair verify 2", EVRTSP_REQ_POST, payload_make_pair_verify2, response_handler_pair_verify2, "application/octet-stream", "/pair-verify", false },
     { AIRPLAY_SEQ_PROBE, "OPTIONS (probe)", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_probe, NULL, "*", true },
   },
   {
@@ -3709,6 +3985,11 @@ static struct airplay_seq_request airplay_seq_request[][7] =
   },
   {
     { AIRPLAY_SEQ_SEND_ARTWORK, "SET_PARAMETER (artwork)", EVRTSP_REQ_SET_PARAMETER, payload_make_send_artwork, NULL, NULL, NULL, true },
+  },
+  {
+    { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", false },
+    { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 2", EVRTSP_REQ_POST, payload_make_pair_setup2, response_handler_pair_setup2, "application/octet-stream", "/pair-setup", false },
+    { AIRPLAY_SEQ_PAIR_SETUP, "pair setup 3", EVRTSP_REQ_POST, payload_make_pair_setup3, response_handler_pair_setup3, "application/octet-stream", "/pair-setup", false },
   },
 };
 
@@ -3855,417 +4136,6 @@ sequence_start(enum airplay_seq_type seq_type, struct airplay_session *rs, void 
 
   sequence_continue(seq_ctx); // Ownership transferred
 }
-
-
-/* ------------------------ Pairing/device verification --------------------- */
-/*                 e.g. for the ATV4 (read it from the bottom and up)         */
-
-#ifdef RAOP_VERIFICATION
-static int
-airplay_pair_response_process(int step, struct evrtsp_request *req, struct airplay_session *rs)
-{
-  uint8_t *response;
-  const char *errmsg;
-  size_t len;
-  int ret;
-
-  rs->reqs_in_flight--;
-
-  if (!req)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Verification step %d to '%s' failed, empty callback\n", step, rs->devname);
-      return -1;
-    }
-
-  if (req->response_code != RTSP_OK)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Verification step %d to '%s' failed with error code %d: %s\n", step, rs->devname, req->response_code, req->response_code_line);
-      return -1;
-    }
-
-  response = evbuffer_pullup(req->input_buffer, -1);
-  len = evbuffer_get_length(req->input_buffer);
-
-  switch (step)
-    {
-      case 1:
-	ret = pair_setup_response1(rs->pair_setup_ctx, response, len);
-	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
-	break;
-      case 2:
-	ret = pair_setup_response2(rs->pair_setup_ctx, response, len);
-	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
-	break;
-      case 3:
-	ret = pair_setup_response3(rs->pair_setup_ctx, response, len);
-	errmsg = pair_setup_errmsg(rs->pair_setup_ctx);
-	break;
-      case 4:
-	ret = pair_verify_response1(rs->pair_verify_ctx, response, len);
-	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
-	break;
-      case 5:
-	ret = pair_verify_response2(rs->pair_verify_ctx, response, len);
-	errmsg = pair_verify_errmsg(rs->pair_verify_ctx);
-	break;
-      default:
-	ret = -1;
-	errmsg = "Bug! Bad step number";
-    }
-
-  if (ret < 0)
-    DPRINTF(E_LOG, L_RAOP, "Verification step %d response from '%s' error: %s\n", step, rs->devname, errmsg);
-
-  return ret;
-}
-
-static int
-airplay_pair_request_send(int step, struct airplay_session *rs, void (*cb)(struct evrtsp_request *, void *))
-{
-  struct evrtsp_request *req;
-  uint8_t *body;
-  uint32_t len;
-  const char *errmsg;
-  const char *url;
-  const char *ctype;
-  int ret;
-
-  switch (step)
-    {
-      case 1:
-	body    = pair_setup_request1(&len, rs->pair_setup_ctx);
-	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup";
-	ctype   = "application/octet-stream";
-	break;
-      case 2:
-	body    = pair_setup_request2(&len, rs->pair_setup_ctx);
-	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup";
-	ctype   = "application/octet-stream";
-	break;
-      case 3:
-	body    = pair_setup_request3(&len, rs->pair_setup_ctx);
-	errmsg  = pair_setup_errmsg(rs->pair_setup_ctx);
-	url     = "/pair-setup";
-	ctype   = "application/octet-stream";
-	break;
-      case 4:
-	body    = pair_verify_request1(&len, rs->pair_verify_ctx);
-	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
-	url     = "/pair-verify";
-	ctype   = "application/octet-stream";
-	break;
-      case 5:
-	body    = pair_verify_request2(&len, rs->pair_verify_ctx);
-	errmsg  = pair_verify_errmsg(rs->pair_verify_ctx);
-	url     = "/pair-verify";
-	ctype   = "application/octet-stream";
-	break;
-      default:
-	body    = NULL;
-	errmsg  = "Bug! Bad step number";
-    }
-
-  if (!body)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Verification step %d request error: %s\n", step, errmsg);
-      return -1;
-    }
-
-  req = evrtsp_request_new(cb, rs);
-  if (!req)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not create RTSP request for verification step %d\n", step);
-      return -1;
-    }
-
-  evbuffer_add(req->output_buffer, body, len);
-  free(body);
-
-  ret = request_headers_add(req, rs, EVRTSP_REQ_POST);
-  if (ret < 0)
-    {
-      evrtsp_request_free(req);
-      return -1;
-    }
-
-  evrtsp_add_header(req->output_headers, "Content-Type", ctype);
-  evrtsp_add_header(req->output_headers, "X-Apple-HKP", "3"); // Required!!
-
-  DPRINTF(E_INFO, L_RAOP, "Making verification request step %d to '%s'\n", step, rs->devname);
-
-  ret = evrtsp_make_request(rs->ctrl, req, EVRTSP_REQ_POST, url);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Verification request step %d to '%s' failed\n", step, rs->devname);
-      return -1;
-    }
-
-  rs->reqs_in_flight++;
-
-  evrtsp_connection_set_closecb(rs->ctrl, NULL, NULL);
-
-  return 0;
-}
-
-static void
-airplay_cb_pair_verify_step2(struct evrtsp_request *req, void *arg)
-{
-  struct airplay_session *rs = arg;
-  struct output_device *device;
-  int ret;
-
-  ret = airplay_pair_response_process(5, req, rs);
-  if (ret < 0)
-    goto error;
-
-  ret = pair_verify_result(rs->shared_secret, sizeof(rs->shared_secret), rs->pair_verify_ctx);
-  if (ret < 0)
-    goto error;
-
-  rs->control_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 0, rs->shared_secret, sizeof(rs->shared_secret));
-  if (!rs->control_cipher_ctx)
-    goto error;
-
-  rs->events_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 1, rs->shared_secret, sizeof(rs->shared_secret));
-  if (!rs->events_cipher_ctx)
-    goto error;
-
-  evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
-
-  DPRINTF(E_INFO, L_RAOP, "Verification of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
-
-  pair_verify_free(rs->pair_verify_ctx);
-  rs->state = AIRPLAY_STATE_STARTUP;
-
-  sequence_start(AIRPLAY_SEQ_START, rs, NULL, "verify_step2");
-
-  return;
-
- error:
-  pair_verify_free(rs->pair_verify_ctx);
-
-  device = outputs_device_get(rs->device_id);
-  if (!device)
-    return;
-
-  // Clear auth_key, the device did not accept it, or some other unexpected error
-  free(device->auth_key);
-  device->auth_key = NULL;
-
-  rs->state = AIRPLAY_STATE_PASSWORD;
-  session_failure(rs);
-}
-
-static void
-airplay_cb_pair_verify_step1(struct evrtsp_request *req, void *arg)
-{
-  struct airplay_session *rs = arg;
-  struct output_device *device;
-  int ret;
-
-  ret = airplay_pair_response_process(4, req, rs);
-  if (ret < 0)
-    {
-      device = outputs_device_get(rs->device_id);
-      if (!device)
-	goto error;
-
-      // Clear auth_key, the device did not accept it
-      free(device->auth_key);
-      device->auth_key = NULL;
-      goto error;
-    }
-
-  ret = airplay_pair_request_send(5, rs, airplay_cb_pair_verify_step2);
-  if (ret < 0)
-    goto error;
-
-  return;
-
- error:
-  pair_verify_free(rs->pair_verify_ctx);
-  rs->pair_verify_ctx = NULL;
-
-  rs->state = AIRPLAY_STATE_PASSWORD;
-  session_failure(rs);
-}
-
-static int
-airplay_pair_verify(struct airplay_session *rs)
-{
-  struct output_device *device;
-  int ret;
-
-  device = outputs_device_get(rs->device_id);
-  if (!device)
-    goto error;
-
-  CHECK_NULL(L_RAOP, rs->pair_verify_ctx = pair_verify_new(PAIR_HOMEKIT, device->auth_key, pair_device_id));
-
-  ret = airplay_pair_request_send(4, rs, airplay_cb_pair_verify_step1);
-  if (ret < 0)
-    goto error;
-
-  return 0;
-
- error:
-  pair_verify_free(rs->pair_verify_ctx);
-  rs->pair_verify_ctx = NULL;
-  return -1;
-}
-
-
-static void
-airplay_cb_pair_setup_step3(struct evrtsp_request *req, void *arg)
-{
-  struct airplay_session *rs = arg;
-  struct output_device *device;
-  const char *authorization_key;
-  int ret;
-
-  ret = airplay_pair_response_process(3, req, rs);
-  if (ret < 0)
-    goto out;
-
-  ret = pair_setup_result(&authorization_key, rs->pair_setup_ctx);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Verification setup result error: %s\n", pair_setup_errmsg(rs->pair_setup_ctx));
-      goto out;
-    }
-
-  DPRINTF(E_LOG, L_RAOP, "Verification setup stage complete, saving authorization key\n");
-
-  device = outputs_device_get(rs->device_id);
-  if (!device)
-    goto out;
-
-  free(device->auth_key);
-  device->auth_key = strdup(authorization_key);
-
-  // A blocking db call... :-~
-  db_speaker_save(device);
-
-  // No longer AIRPLAY_STATE_PASSWORD
-  rs->state = AIRPLAY_STATE_STOPPED;
-
- out:
-  pair_setup_free(rs->pair_setup_ctx);
-  rs->pair_setup_ctx = NULL;
-
-  // Callback to player with result
-  session_status(rs);
-
-  // We are telling the player that the device is now stopped, so we don't need
-  // the session any more
-  session_cleanup(rs);
-}
-
-static void
-airplay_cb_pair_setup_step2(struct evrtsp_request *req, void *arg)
-{
-  struct airplay_session *rs = arg;
-  int ret;
-
-  ret = airplay_pair_response_process(2, req, rs);
-  if (ret < 0)
-    goto error;
-
-  ret = airplay_pair_request_send(3, rs, airplay_cb_pair_setup_step3);
-  if (ret < 0)
-    goto error;
-
-  return;
-
- error:
-  pair_setup_free(rs->pair_setup_ctx);
-  rs->pair_setup_ctx = NULL;
-  session_failure(rs);
-}
-
-static void
-airplay_cb_pair_setup_step1(struct evrtsp_request *req, void *arg)
-{
-  struct airplay_session *rs = arg;
-  int ret;
-
-  ret = airplay_pair_response_process(1, req, rs);
-  if (ret < 0)
-    goto error;
-
-  ret = airplay_pair_request_send(2, rs, airplay_cb_pair_setup_step2);
-  if (ret < 0)
-    goto error;
-
-  return;
-
- error:
-  pair_setup_free(rs->pair_setup_ctx);
-  rs->pair_setup_ctx = NULL;
-  session_failure(rs);
-}
-
-static int
-airplay_pair_setup(struct airplay_session *rs, const char *pin)
-{
-  int ret;
-
-  rs->pair_setup_ctx = pair_setup_new(PAIR_HOMEKIT, pin, pair_device_id);
-  if (!rs->pair_setup_ctx)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Out of memory for verification setup context\n");
-      return -1;
-    }
-
-  ret = airplay_pair_request_send(1, rs, airplay_cb_pair_setup_step1);
-  if (ret < 0)
-    goto error;
-
-  rs->state = AIRPLAY_STATE_PASSWORD;
-
-  return 0;
-
- error:
-  pair_setup_free(rs->pair_setup_ctx);
-  rs->pair_setup_ctx = NULL;
-  return -1;
-}
-
-static int
-airplay_device_authorize(struct output_device *device, const char *pin, int callback_id)
-{
-  struct airplay_session *rs;
-  int ret;
-
-  // Make a session so we can communicate with the device
-  rs = session_make(device, callback_id);
-  if (!rs)
-    return -1;
-
-  ret = airplay_pair_setup(rs, pin);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not send verification setup request to '%s' (address %s)\n", device->name, rs->address);
-      session_cleanup(rs);
-      return -1;
-    }
-
-  return 1;
-}
-
-#else
-static int
-airplay_pair_verify(struct airplay_session *rs)
-{
-  DPRINTF(E_LOG, L_RAOP, "Device '%s' requires verification, but forked-daapd was built with --disable-verification\n", rs->devname);
-
-  return -1;
-}
-#endif /* RAOP_VERIFICATION */
-
-
 
 
 /* ---------------- Airplay devices discovery - mDNS callback --------------- */
@@ -4509,7 +4379,6 @@ static int
 airplay_device_start_generic(struct output_device *device, int callback_id, bool only_probe)
 {
   struct airplay_session *rs;
-  int ret;
 
   /* Send an OPTIONS request to establish the connection. If device verification
    * is required we start with that. After that, we can determine our local
@@ -4520,20 +4389,7 @@ airplay_device_start_generic(struct output_device *device, int callback_id, bool
   if (!rs)
     return -1;
 
-  if (device->auth_key)
-    {
-      ret = airplay_pair_verify(rs);
-      if (ret < 0)
-	{
-	  DPRINTF(E_WARN, L_RAOP, "Could not send verification request to '%s' (address %s)\n", device->name, rs->address);
-	  session_cleanup(rs);
-	  return -1;
-	}
-
-      return 1;
-    }
-
-  if (device->requires_auth)
+  if (!device->auth_key)
     sequence_start(AIRPLAY_SEQ_PIN_START, rs, NULL, "device_start");
   else if (only_probe)
     sequence_start(AIRPLAY_SEQ_PROBE, rs, NULL, "device_start");
@@ -4596,6 +4452,21 @@ airplay_device_free_extra(struct output_device *device)
   struct airplay_extra *re = device->extra_device_info;
 
   free(re);
+}
+
+static int
+airplay_device_authorize(struct output_device *device, const char *pin, int callback_id)
+{
+  struct airplay_session *rs;
+
+  // Make a session so we can communicate with the device
+  rs = session_make(device, callback_id);
+  if (!rs)
+    return -1;
+
+  sequence_start(AIRPLAY_SEQ_PAIR_SETUP, rs, (void *)pin, "device_authorize");
+
+  return 1;
 }
 
 static void
@@ -4830,7 +4701,5 @@ struct output_definition output_airplay =
   .metadata_prepare = airplay_metadata_prepare,
   .metadata_send = airplay_metadata_send,
   .metadata_purge = airplay_metadata_purge,
-#ifdef RAOP_VERIFICATION
   .device_authorize = airplay_device_authorize,
-#endif
 };
