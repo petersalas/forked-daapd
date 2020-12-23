@@ -1245,6 +1245,14 @@ session_success(struct airplay_session *rs)
   session_cleanup(rs);
 }
 
+static void
+session_connected(struct airplay_session *rs)
+{
+  rs->state = AIRPLAY_STATE_CONNECTED;
+
+  session_status(rs);
+}
+
 static int
 session_connection_setup(struct airplay_session *rs, struct output_device *rd, int family)
 {
@@ -3186,8 +3194,6 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
   if (ret < 0)
     return AIRPLAY_SEQ_ABORT;
 
-  rs->state = AIRPLAY_STATE_CONNECTED;
-
   return AIRPLAY_SEQ_CONTINUE;
 }
 
@@ -3543,8 +3549,8 @@ static struct airplay_seq_definition airplay_seq_definition[] =
 {
   { AIRPLAY_SEQ_START, NULL, start_retry },
   { AIRPLAY_SEQ_START_RERUN, NULL, start_retry },
-  { AIRPLAY_SEQ_START_AP2, session_status, start_failure },
-  { AIRPLAY_SEQ_START_AP2_WITH_AUTH, session_status, start_failure },
+  { AIRPLAY_SEQ_START_AP2, session_connected, start_failure },
+  { AIRPLAY_SEQ_START_AP2_WITH_AUTH, session_connected, start_failure },
   { AIRPLAY_SEQ_PROBE, session_success, session_failure },
   { AIRPLAY_SEQ_FLUSH, session_status, session_failure },
   { AIRPLAY_SEQ_STOP, session_success, session_failure },
@@ -3575,8 +3581,8 @@ static struct airplay_seq_request airplay_seq_request[][7] =
     { AIRPLAY_SEQ_START_AP2, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
-    { AIRPLAY_SEQ_START_AP2, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
+    { AIRPLAY_SEQ_START_AP2, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
   },
   {
     { AIRPLAY_SEQ_START_AP2_WITH_AUTH, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
