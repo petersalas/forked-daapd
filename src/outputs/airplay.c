@@ -1,9 +1,4 @@
 /*
- * Crypto code adapted from VideoLAN
- *   Copyright (C) 2008 the VideoLAN team
- *   Author: Michael Hanselmann
- *   GPLv2+
- *
  * ALAC encoding adapted from airplay_play
  *   Copyright (C) 2005 Shiro Ninomiya <shiron@snino.com>
  *   GPLv2+
@@ -318,27 +313,6 @@ struct airplay_seq_ctx
   const char *log_caller;
 };
 
-
-static const uint8_t airplay_rsa_pubkey[] =
-  "\xe7\xd7\x44\xf2\xa2\xe2\x78\x8b\x6c\x1f\x55\xa0\x8e\xb7\x05\x44"
-  "\xa8\xfa\x79\x45\xaa\x8b\xe6\xc6\x2c\xe5\xf5\x1c\xbd\xd4\xdc\x68"
-  "\x42\xfe\x3d\x10\x83\xdd\x2e\xde\xc1\xbf\xd4\x25\x2d\xc0\x2e\x6f"
-  "\x39\x8b\xdf\x0e\x61\x48\xea\x84\x85\x5e\x2e\x44\x2d\xa6\xd6\x26"
-  "\x64\xf6\x74\xa1\xf3\x04\x92\x9a\xde\x4f\x68\x93\xef\x2d\xf6\xe7"
-  "\x11\xa8\xc7\x7a\x0d\x91\xc9\xd9\x80\x82\x2e\x50\xd1\x29\x22\xaf"
-  "\xea\x40\xea\x9f\x0e\x14\xc0\xf7\x69\x38\xc5\xf3\x88\x2f\xc0\x32"
-  "\x3d\xd9\xfe\x55\x15\x5f\x51\xbb\x59\x21\xc2\x01\x62\x9f\xd7\x33"
-  "\x52\xd5\xe2\xef\xaa\xbf\x9b\xa0\x48\xd7\xb8\x13\xa2\xb6\x76\x7f"
-  "\x6c\x3c\xcf\x1e\xb4\xce\x67\x3d\x03\x7b\x0d\x2e\xa3\x0c\x5f\xff"
-  "\xeb\x06\xf8\xd0\x8a\xdd\xe4\x09\x57\x1a\x9c\x68\x9f\xef\x10\x72"
-  "\x88\x55\xdd\x8c\xfb\x9a\x8b\xef\x5c\x89\x43\xef\x3b\x5f\xaa\x15"
-  "\xdd\xe6\x98\xbe\xdd\xf3\x59\x96\x03\xeb\x3e\x6f\x61\x37\x2b\xb6"
-  "\x28\xf6\x55\x9f\x59\x9a\x78\xbf\x50\x06\x87\xaa\x7f\x49\x76\xc0"
-  "\x56\x2d\x41\x29\x56\xf8\x98\x9e\x18\xa6\x35\x5b\xd8\x15\x97\x82"
-  "\x5e\x0f\xc8\x75\x34\x3e\xc7\x82\x11\x76\x25\xcd\xbf\x98\x44\x7b";
-
-static const uint8_t airplay_rsa_exp[] = "\x01\x00\x01";
-
 static const uint8_t airplay_auth_setup_pubkey[] =
   "\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
   "\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
@@ -419,15 +393,6 @@ static struct media_quality airplay_quality_default =
 
 /* From player.c */
 extern struct event_base *evbase_player;
-
-/* RAOP AES stream key */
-static uint8_t airplay_aes_key[16];
-static uint8_t airplay_aes_iv[16];
-static gcry_cipher_hd_t airplay_aes_ctx;
-
-/* Base64-encoded AES key and IV for SDP */
-static char *airplay_aes_key_b64;
-static char *airplay_aes_iv_b64;
 
 /* AirTunes v2 time synchronization */
 static struct airplay_service timing_4svc;
@@ -607,345 +572,6 @@ encrypt_chacha(uint8_t *cipher, uint8_t *plain, size_t plain_len, const uint8_t 
  error:
   gcry_cipher_close(hd);
   return -1;
-}
-
-// MGF1 is specified in RFC2437, section 10.2.1. Variables are named after the
-// specification.
-static int
-airplay_crypt_mgf1(uint8_t *mask, size_t l, const uint8_t *z, const size_t zlen, const int hash)
-{
-  char ebuf[64];
-  gcry_md_hd_t md_hdl;
-  gpg_error_t gc_err;
-  uint8_t *md;
-  uint32_t counter;
-  uint8_t c[4];
-  size_t copylen;
-  int len;
-
-  gc_err = gcry_md_open(&md_hdl, hash, 0);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not open hash: %s\n", ebuf);
-
-      return -1;
-    }
-
-  len = gcry_md_get_algo_dlen(hash);
-
-  counter = 0;
-  while (l > 0)
-    {
-      /* 3. For counter from 0 to \lceil{l / len}\rceil-1, do the following:
-       * a. Convert counter to an octet string C of length 4 with the
-       *    primitive I2OSP: C = I2OSP (counter, 4)
-       */
-      c[0] = (counter >> 24) & 0xff;
-      c[1] = (counter >> 16) & 0xff;
-      c[2] = (counter >> 8) & 0xff;
-      c[3] = counter & 0xff;
-      ++counter;
-
-      /* b. Concatenate the hash of the seed z and c to the octet string T:
-       *    T = T || Hash (Z || C)
-       */
-      gcry_md_reset(md_hdl);
-      gcry_md_write(md_hdl, z, zlen);
-      gcry_md_write(md_hdl, c, 4);
-      md = gcry_md_read(md_hdl, hash);
-
-      /* 4. Output the leading l octets of T as the octet string mask. */
-      copylen = MIN(l, len);
-      memcpy(mask, md, copylen);
-      mask += copylen;
-      l -= copylen;
-    }
-
-  gcry_md_close(md_hdl);
-
-  return 0;
-}
-
-/* EME-OAEP-ENCODE is specified in RFC2437, section 9.1.1.1. Variables are
- * named after the specification.
- */
-static int
-airplay_crypt_add_oaep_padding(uint8_t *em, const size_t emlen, const uint8_t *m, const size_t mlen, const uint8_t *p, const size_t plen)
-{
-  uint8_t *seed;
-  uint8_t *db;
-  uint8_t *db_mask;
-  uint8_t *seed_mask;
-  size_t emlen_max;
-  size_t pslen;
-  size_t i;
-  int hlen;
-  int ret;
-
-  /* Space for 0x00 prefix in EM. */
-  emlen_max = emlen - 1;
-
-  hlen = gcry_md_get_algo_dlen(GCRY_MD_SHA1);
-
-  /* Step 2:
-   * If ||M|| > emLen-2hLen-1 then output "message too long" and stop.
-   */
-  if (mlen > (emlen_max - (2 * hlen) - 1))
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not add OAEP padding: message too long\n");
-
-      return -1;
-    }
-
-  /* Step 3:
-   * Generate an octet string PS consisting of emLen-||M||-2hLen-1 zero
-   * octets. The length of PS may be 0.
-   */
-  pslen = emlen_max - mlen - (2 * hlen) - 1;
-
-  /*
-   * Step 5:
-   * Concatenate pHash, PS, the message M, and other padding to form a data
-   * block DB as: DB = pHash || PS || 01 || M
-   */
-  db = calloc(1, hlen + pslen + 1 + mlen);
-  db_mask = calloc(1, emlen_max - hlen);
-  seed_mask = calloc(1, hlen);
-
-  if (!db || !db_mask || !seed_mask)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not allocate memory for OAEP padding\n");
-
-      if (db)
-	free(db);
-      if (db_mask)
-	free(db_mask);
-      if (seed_mask)
-	free(seed_mask);
-
-      return -1;
-    }
-
-  /* Step 4:
-   * Let pHash = Hash(P), an octet string of length hLen.
-   */
-  gcry_md_hash_buffer(GCRY_MD_SHA1, db, p, plen);
-
-  /* Step 3:
-   * Generate an octet string PS consisting of emLen-||M||-2hLen-1 zero
-   * octets. The length of PS may be 0.
-   */
-  memset(db + hlen, 0, pslen);
-
-  /* Step 5:
-   * Concatenate pHash, PS, the message M, and other padding to form a data
-   * block DB as: DB = pHash || PS || 01 || M
-   */
-  db[hlen + pslen] = 0x01;
-  memcpy(db + hlen + pslen + 1, m, mlen);
-
-  /* Step 6:
-   * Generate a random octet string seed of length hLen
-   */
-  seed = gcry_random_bytes(hlen, GCRY_STRONG_RANDOM);
-  if (!seed)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not allocate memory for OAEP seed\n");
-
-      ret = -1;
-      goto out_free_alloced;
-    }
-
-  /* Step 7:
-   * Let dbMask = MGF(seed, emLen-hLen).
-   */
-  ret = airplay_crypt_mgf1(db_mask, emlen_max - hlen, seed, hlen, GCRY_MD_SHA1);
-  if (ret < 0)
-    goto out_free_all;
-
-  /* Step 8:
-   * Let maskedDB = DB \xor dbMask.
-   */
-  for (i = 0; i < (emlen_max - hlen); i++)
-    db[i] ^= db_mask[i];
-
-  /* Step 9:
-   * Let seedMask = MGF(maskedDB, hLen).
-   */
-  ret = airplay_crypt_mgf1(seed_mask, hlen, db, emlen_max - hlen, GCRY_MD_SHA1);
-  if (ret < 0)
-    goto out_free_all;
-
-  /* Step 10:
-   * Let maskedSeed = seed \xor seedMask.
-   */
-  for (i = 0; i < hlen; i++)
-    seed[i] ^= seed_mask[i];
-
-  /* Step 11:
-   * Let EM = maskedSeed || maskedDB.
-   */
-  em[0] = 0x00;
-  memcpy(em + 1, seed, hlen);
-  memcpy(em + 1 + hlen, db, hlen + pslen + 1 + mlen);
-
-  /* Step 12:
-   * Output EM.
-   */
-
-  ret = 0;
-
- out_free_all:
-  free(seed);
- out_free_alloced:
-  free(db);
-  free(db_mask);
-  free(seed_mask);
-
-  return ret;
-}
-
-static char *
-airplay_crypt_encrypt_aes_key_base64(void)
-{
-  char ebuf[64];
-  uint8_t padded_key[256];
-  gpg_error_t gc_err;
-  gcry_sexp_t sexp_rsa_params;
-  gcry_sexp_t sexp_input;
-  gcry_sexp_t sexp_encrypted;
-  gcry_sexp_t sexp_token_a;
-  gcry_mpi_t mpi_pubkey;
-  gcry_mpi_t mpi_exp;
-  gcry_mpi_t mpi_input;
-  gcry_mpi_t mpi_output;
-  char *result;
-  uint8_t *value;
-  size_t value_size;
-  int ret;
-
-  result = NULL;
-
-  /* Add RSA-OAES-SHA1 padding */
-  ret = airplay_crypt_add_oaep_padding(padded_key, sizeof(padded_key), airplay_aes_key, sizeof(airplay_aes_key), NULL, 0);
-  if (ret < 0)
-    return NULL;
-
-  /* Read public key */
-  gc_err = gcry_mpi_scan(&mpi_pubkey, GCRYMPI_FMT_USG, airplay_rsa_pubkey, sizeof(airplay_rsa_pubkey) - 1, NULL);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not read RAOP RSA pubkey: %s\n", ebuf);
-
-      return NULL;
-    }
-
-  /* Read exponent */
-  gc_err = gcry_mpi_scan(&mpi_exp, GCRYMPI_FMT_USG, airplay_rsa_exp, sizeof(airplay_rsa_exp) - 1, NULL);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not read RAOP RSA exponent: %s\n", ebuf);
-
-      goto out_free_mpi_pubkey;
-    }
-
-  /* If the input data starts with a set bit (0x80), gcrypt thinks it's a
-   * signed integer and complains. Prefixing it with a zero byte (\0)
-   * works, but involves more work. Converting it to an MPI in our code is
-   * cleaner.
-   */
-  gc_err = gcry_mpi_scan(&mpi_input, GCRYMPI_FMT_USG, padded_key, sizeof(padded_key), NULL);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not convert input data: %s\n", ebuf);
-
-      goto out_free_mpi_exp;
-    }
-
-  /* Build S-expression with RSA parameters */
-  gc_err = gcry_sexp_build(&sexp_rsa_params, NULL, "(public-key(rsa(n %m)(e %m)))", mpi_pubkey, mpi_exp);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not build RSA params S-exp: %s\n", ebuf);
-
-      goto out_free_mpi_input;
-    }
-
-  /* Build S-expression for data */
-  gc_err = gcry_sexp_build(&sexp_input, NULL, "(data(value %m))", mpi_input);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not build data S-exp: %s\n", ebuf);
-
-      goto out_free_sexp_params;
-    }
-
-  /* Encrypt data */
-  gc_err = gcry_pk_encrypt(&sexp_encrypted, sexp_input, sexp_rsa_params);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not encrypt data: %s\n", ebuf);
-
-      goto out_free_sexp_input;
-    }
-
-  /* Extract encrypted data */
-  sexp_token_a = gcry_sexp_find_token(sexp_encrypted, "a", 0);
-  if (!sexp_token_a)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Could not find token 'a' in result S-exp\n");
-
-      goto out_free_sexp_encrypted;
-    }
-
-  mpi_output = gcry_sexp_nth_mpi(sexp_token_a, 1, GCRYMPI_FMT_USG);
-  if (!mpi_output)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Cannot extract MPI from result\n");
-
-      goto out_free_sexp_token_a;
-    }
-
-  /* Copy encrypted data into char array */
-  gc_err = gcry_mpi_aprint(GCRYMPI_FMT_USG, &value, &value_size, mpi_output);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not copy encrypted data: %s\n", ebuf);
-
-      goto out_free_mpi_output;
-    }
-
-  /* Encode in Base64 */
-  result = b64_encode(value, value_size);
-
-  free(value);
-
- out_free_mpi_output:
-  gcry_mpi_release(mpi_output);
- out_free_sexp_token_a:
-  gcry_sexp_release(sexp_token_a);
- out_free_sexp_encrypted:
-  gcry_sexp_release(sexp_encrypted);
- out_free_sexp_input:
-  gcry_sexp_release(sexp_input);
- out_free_sexp_params:
-  gcry_sexp_release(sexp_rsa_params);
- out_free_mpi_input:
-  gcry_mpi_release(mpi_input);
- out_free_mpi_exp:
-  gcry_mpi_release(mpi_exp);
- out_free_mpi_pubkey:
-  gcry_mpi_release(mpi_pubkey);
-
-  return result;
 }
 
 
@@ -4524,9 +4150,6 @@ airplay_write(struct output_buffer *obuf)
 static int
 airplay_init(void)
 {
-  char ebuf[64];
-  char *ptr;
-  gpg_error_t gc_err;
   int v6enabled;
   int family;
   int ret;
@@ -4554,56 +4177,6 @@ airplay_init(void)
 	  return -1;
         }
     }
-
-  // Generate AES key and IV
-  gcry_randomize(airplay_aes_key, sizeof(airplay_aes_key), GCRY_STRONG_RANDOM);
-  gcry_randomize(airplay_aes_iv, sizeof(airplay_aes_iv), GCRY_STRONG_RANDOM);
-
-  // Setup AES
-  gc_err = gcry_cipher_open(&airplay_aes_ctx, GCRY_CIPHER_AES, GCRY_CIPHER_MODE_CBC, 0);
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not open AES cipher: %s\n", ebuf);
-
-      return -1;
-    }
-
-  // Set key
-  gc_err = gcry_cipher_setkey(airplay_aes_ctx, airplay_aes_key, sizeof(airplay_aes_key));
-  if (gc_err != GPG_ERR_NO_ERROR)
-    {
-      gpg_strerror_r(gc_err, ebuf, sizeof(ebuf));
-      DPRINTF(E_LOG, L_RAOP, "Could not set AES key: %s\n", ebuf);
-
-      goto out_close_cipher;
-    }
-
-  // Prepare Base64-encoded key & IV for SDP
-  airplay_aes_key_b64 = airplay_crypt_encrypt_aes_key_base64();
-  if (!airplay_aes_key_b64)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't encrypt and encode AES session key\n");
-
-      goto out_close_cipher;
-    }
-
-  airplay_aes_iv_b64 = b64_encode(airplay_aes_iv, sizeof(airplay_aes_iv));
-  if (!airplay_aes_iv_b64)
-    {
-      DPRINTF(E_LOG, L_RAOP, "Couldn't encode AES IV\n");
-
-      goto out_free_b64_key;
-    }
-
-  // Remove base64 padding
-  ptr = strchr(airplay_aes_key_b64, '=');
-  if (ptr)
-    *ptr = '\0';
-
-  ptr = strchr(airplay_aes_iv_b64, '=');
-  if (ptr)
-    *ptr = '\0';
 
   CHECK_NULL(L_RAOP, keep_alive_timer = evtimer_new(evbase_player, airplay_keep_alive_timer_cb, NULL));
 
@@ -4649,11 +4222,6 @@ airplay_init(void)
   airplay_timing_stop();
  out_free_timer:
   event_free(keep_alive_timer);
-  free(airplay_aes_iv_b64);
- out_free_b64_key:
-  free(airplay_aes_key_b64);
- out_close_cipher:
-  gcry_cipher_close(airplay_aes_ctx);
 
   return -1;
 }
@@ -4674,11 +4242,6 @@ airplay_deinit(void)
   airplay_timing_stop();
 
   event_free(keep_alive_timer);
-
-  gcry_cipher_close(airplay_aes_ctx);
-
-  free(airplay_aes_key_b64);
-  free(airplay_aes_iv_b64);
 }
 
 struct output_definition output_airplay =
