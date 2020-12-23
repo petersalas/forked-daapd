@@ -1828,12 +1828,12 @@ packets_send(struct airplay_master_session *rms)
       // Device just joined
       if (rs->state == AIRPLAY_STATE_CONNECTED)
 	{
-	  pkt->header[1] = 0xe0;
+	  pkt->header[1] = (1 << 7) | RAOP_RTP_PAYLOADTYPE;
 	  packet_send(rs, pkt);
 	}
       else if (rs->state == AIRPLAY_STATE_STREAMING)
 	{
-	  pkt->header[1] = 0x60;
+	  pkt->header[1] = RAOP_RTP_PAYLOADTYPE;
 	  packet_send(rs, pkt);
 	}
     }
@@ -2677,7 +2677,7 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
   wplist_dict_add_uint(stream, "spf", 352); // frames per packet
   wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
-  wplist_dict_add_uint(stream, "type", RAOP_RTP_PAYLOADTYPE); // RTP type, 0x06 = 96 real time, 103 buffered
+  wplist_dict_add_uint(stream, "type", RAOP_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
   streams = plist_new_array();
   plist_array_append_item(streams, stream);
 
