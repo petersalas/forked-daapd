@@ -994,13 +994,19 @@ rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 
   if (encrypt)
     {
-      DHEXDUMP(E_DBG, L_RAOP, in, in_len, "Encrypting outgoing request\n");
+      if (in_len < 4096)
+	DHEXDUMP(E_DBG, L_RAOP, in, in_len, "Encrypting outgoing request\n");
+      else
+	DPRINTF(E_DBG, L_RAOP, "Encrypting outgoing request (size %zu)\n", in_len);
       ret = pair_encrypt(&out, &out_len, in, in_len, rs->control_cipher_ctx);
     }
   else
     {
       ret = pair_decrypt(&out, &out_len, in, in_len, rs->control_cipher_ctx);
-      DHEXDUMP(E_DBG, L_RAOP, out, out_len, "Decrypted incoming response\n");
+      if (out_len < 4096)
+	DHEXDUMP(E_DBG, L_RAOP, out, out_len, "Decrypted incoming response\n");
+      else
+	DPRINTF(E_DBG, L_RAOP, "Decrypted incoming response (size %zu)\n", out_len);
     }
 
   evbuffer_drain(evbuf, in_len);
