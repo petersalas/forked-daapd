@@ -958,6 +958,7 @@ metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_
     *start, *display, *pos, *end, rtp_session->pos, rms->cur_stamp.pos);
 }
 
+// TODO not clear if Airplay 2 uses this header
 static int
 rtpinfo_header_add(struct evrtsp_request *req, struct airplay_session *rs, struct output_metadata *metadata)
 {
@@ -1526,7 +1527,7 @@ airplay_metadata_send_generic(struct airplay_session *rs, struct output_metadata
     sequence_start(AIRPLAY_SEQ_SEND_PROGRESS, rs, metadata, "SET_PARAMETER (progress)");
 
   if (!only_progress && (rs->wanted_metadata & RAOP_MD_WANTS_TEXT))
-    sequence_start(AIRPLAY_SEQ_SEND_PROGRESS, rs, metadata, "SET_PARAMETER (text)");
+    sequence_start(AIRPLAY_SEQ_SEND_TEXT, rs, metadata, "SET_PARAMETER (text)");
 
   if (!only_progress && (rs->wanted_metadata & RAOP_MD_WANTS_ARTWORK) && rmd->artwork)
     sequence_start(AIRPLAY_SEQ_SEND_ARTWORK, rs, metadata, "SET_PARAMETER (artwork)");
@@ -3205,7 +3206,7 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
 {
   int ret;
 
-  ret = airplay_metadata_startup_send(rs); // Should this be added to the startup sequence?
+  ret = airplay_metadata_startup_send(rs); // TODO Should this be added to the startup sequence?
   if (ret < 0)
     return AIRPLAY_SEQ_ABORT;
 
