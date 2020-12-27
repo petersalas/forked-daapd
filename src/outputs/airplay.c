@@ -2954,7 +2954,7 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs,
 {
   char *pin = arg;
 
-  rs->pair_setup_ctx = pair_setup_new(PAIR_HOMEKIT, pin, pair_device_id);
+  rs->pair_setup_ctx = pair_setup_new(PAIR_HOMEKIT_NORMAL, pin, pair_device_id);
   if (!rs->pair_setup_ctx)
     {
       DPRINTF(E_LOG, L_RAOP, "Out of memory for verification setup context\n");
@@ -2987,7 +2987,7 @@ payload_make_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs
   if (!device)
     return -1;
 
-  rs->pair_verify_ctx = pair_verify_new(PAIR_HOMEKIT, device->auth_key, pair_device_id);
+  rs->pair_verify_ctx = pair_verify_new(PAIR_HOMEKIT_NORMAL, device->auth_key, pair_device_id);
   if (!rs->pair_verify_ctx)
     {
       DPRINTF(E_LOG, L_RAOP, "Out of memory for verification verify context\n");
@@ -3423,7 +3423,7 @@ response_handler_pair_setup3(struct evrtsp_request *req, struct airplay_session 
   if (seq_type != AIRPLAY_SEQ_CONTINUE)
     return seq_type;
 
-  ret = pair_setup_result(&authorization_key, rs->pair_setup_ctx);
+  ret = pair_setup_result(&authorization_key, NULL, NULL, rs->pair_setup_ctx);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Verification setup result error: %s\n", pair_setup_errmsg(rs->pair_setup_ctx));
@@ -3478,27 +3478,37 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
 {
   struct output_device *device;
   enum airplay_seq_type seq_type;
+  const uint8_t *shared_secret;
+  size_t shared_secret_len;
   int ret;
 
   seq_type = response_handler_pair_generic(5, req, rs);
   if (seq_type != AIRPLAY_SEQ_CONTINUE)
     goto error;
 
-  ret = pair_verify_result(rs->shared_secret, sizeof(rs->shared_secret), rs->pair_verify_ctx);
+  ret = pair_verify_result(&shared_secret, &shared_secret_len, rs->pair_verify_ctx);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_RAOP, "Verification verify result error: %s\n", pair_verify_errmsg(rs->pair_verify_ctx));
       goto error;
     }
 
-  rs->control_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 0, rs->shared_secret, sizeof(rs->shared_secret));
+  if (sizeof(rs->shared_secret) != shared_secret_len)
+    {
+      DPRINTF(E_LOG, L_RAOP, "Verification verify result error: Unexpected key length (%zu)\n", shared_secret_len);
+      goto error;
+    }
+
+  memcpy(rs->shared_secret, shared_secret, shared_secret_len);
+
+  rs->control_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT_NORMAL, 0, rs->shared_secret, sizeof(rs->shared_secret));
   if (!rs->control_cipher_ctx)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create control ciphering context\n");
       goto error;
     }
 
-  rs->events_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT, 1, rs->shared_secret, sizeof(rs->shared_secret));
+  rs->events_cipher_ctx = pair_cipher_new(PAIR_HOMEKIT_NORMAL, 1, rs->shared_secret, sizeof(rs->shared_secret));
   if (!rs->events_cipher_ctx)
     {
       DPRINTF(E_LOG, L_RAOP, "Could not create events ciphering context\n");
