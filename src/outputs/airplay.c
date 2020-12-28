@@ -62,7 +62,7 @@
 // Airplay 2 has a gazallion parameters, many of them unknown to us. With the
 // below it is possible to easily try different variations.
 #define AIRPLAY_USE_STREAMID                 0
-#define AIRPLAY_USE_PAIRING_TRANSIENT        0
+#define AIRPLAY_USE_PAIRING_TRANSIENT        1
 
 
 #define ALAC_HEADER_LEN                      3
@@ -328,9 +328,11 @@ struct airplay_seq_ctx
 
 /* ------------------------------ MISC GLOBALS ------------------------------ */
 
+/*
 static const uint8_t airplay_auth_setup_pubkey[] =
   "\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
   "\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
+*/
 
 struct features_type_map
 {
@@ -1284,10 +1286,10 @@ session_connected(struct airplay_session *rs)
 static void
 session_pair_success(struct airplay_session *rs)
 {
-  if (rs->next_seq)
+  if (rs->next_seq != AIRPLAY_SEQ_CONTINUE)
     {
       sequence_start(rs->next_seq, rs, NULL, "pair_success");
-      rs->next_seq = 0;
+      rs->next_seq = AIRPLAY_SEQ_CONTINUE;
       return;
     }
 
@@ -1408,6 +1410,7 @@ session_make(struct output_device *rd, int callback_id)
   rs->supports_auth_setup = re->supports_auth_setup;
   rs->wanted_metadata = re->wanted_metadata;
 
+  rs->next_seq = AIRPLAY_SEQ_CONTINUE;
   rs->pair_type = PAIR_HOMEKIT_NORMAL;
 #if AIRPLAY_USE_PAIRING_TRANSIENT
   if (re->supports_pairing_transient)
@@ -2908,7 +2911,7 @@ Good to know (source Apple's MFi Accessory Interface Specification):
 
 Since we don't do auth or encryption, we currently just ignore the reponse.
 */
-
+/*
 static int
 payload_make_auth_setup(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
@@ -2922,7 +2925,7 @@ payload_make_auth_setup(struct evrtsp_request *req, struct airplay_session *rs, 
 
   return 0;
 }
-
+*/
 static int
 payload_make_pin_start(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
@@ -3684,7 +3687,7 @@ static struct airplay_seq_request airplay_seq_request[][7] =
     { AIRPLAY_SEQ_START_RERUN, "OPTIONS (re-run)", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_start, NULL, "*", false },
   },
   {
-    { AIRPLAY_SEQ_START_AP2, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
+//    { AIRPLAY_SEQ_START_AP2, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
     { AIRPLAY_SEQ_START_AP2, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
     { AIRPLAY_SEQ_START_AP2, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
