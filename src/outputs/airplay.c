@@ -2929,7 +2929,7 @@ payload_make_auth_setup(struct evrtsp_request *req, struct airplay_session *rs, 
 static int
 payload_make_pin_start(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
-  DPRINTF(E_LOG, L_RAOP, "Starting device verification for '%s', go to the web interface and enter PIN\n", rs->devname);
+  DPRINTF(E_LOG, L_RAOP, "Starting device pairing for '%s', go to the web interface and enter PIN\n", rs->devname);
   return 0;
 }
 
@@ -3431,7 +3431,8 @@ response_handler_pair_generic(int step, struct evrtsp_request *req, struct airpl
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Verification step %d response from '%s' error: %s\n", step, rs->devname, errmsg);
+      DPRINTF(E_LOG, L_RAOP, "Pairing step %d response from '%s' error: %s\n", step, rs->devname, errmsg);
+      DHEXDUMP(E_DBG, L_RAOP, response, len, "Raw response");
       return AIRPLAY_SEQ_ABORT;
     }
 
@@ -3531,11 +3532,11 @@ response_handler_pair_setup3(struct evrtsp_request *req, struct airplay_session 
   ret = pair_setup_result(&authorization_key, NULL, NULL, rs->pair_setup_ctx);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Verification setup result error: %s\n", pair_setup_errmsg(rs->pair_setup_ctx));
+      DPRINTF(E_LOG, L_RAOP, "Pair setup result error: %s\n", pair_setup_errmsg(rs->pair_setup_ctx));
       return AIRPLAY_SEQ_ABORT;
     }
 
-  DPRINTF(E_LOG, L_RAOP, "Verification setup stage complete, saving authorization key\n");
+  DPRINTF(E_LOG, L_RAOP, "Pair setup stage complete, saving authorization key\n");
 
   device = outputs_device_get(rs->device_id);
   if (!device)
@@ -3594,13 +3595,13 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
   ret = pair_verify_result(&shared_secret, &shared_secret_len, rs->pair_verify_ctx);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_RAOP, "Verification verify result error: %s\n", pair_verify_errmsg(rs->pair_verify_ctx));
+      DPRINTF(E_LOG, L_RAOP, "Pair verify result error: %s\n", pair_verify_errmsg(rs->pair_verify_ctx));
       goto error;
     }
 
   if (sizeof(rs->shared_secret) != shared_secret_len)
     {
-      DPRINTF(E_LOG, L_RAOP, "Verification verify result error: Unexpected key length (%zu)\n", shared_secret_len);
+      DPRINTF(E_LOG, L_RAOP, "Pair verify result error: Unexpected key length (%zu)\n", shared_secret_len);
       goto error;
     }
 
@@ -3622,7 +3623,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
 
   evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
 
-  DPRINTF(E_INFO, L_RAOP, "Verification of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
+  DPRINTF(E_INFO, L_RAOP, "Pairing  of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
 
   rs->state = AIRPLAY_STATE_STARTUP;
 
