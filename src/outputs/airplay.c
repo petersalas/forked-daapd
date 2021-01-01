@@ -374,7 +374,6 @@ static const struct features_type_map features_map[] =
     { 43, "SupportsSystemPairing" },
     { 44, "IsAPValeriaScreenSender" },
     { 46, "SupportsHKPairingAndAccessControl" },
-    { 47, "SupportsTransient" }, // TODO Check if this is the right bit
     { 48, "SupportsCoreUtilsPairingAndEncryption" }, // 38 || 46 || 43 || 48
     { 49, "SupportsAirPlayVideoV2" },
     { 50, "MetadataFeatures_3" }, // Send NowPlaying info via bplist
@@ -1413,7 +1412,8 @@ session_make(struct output_device *rd, int callback_id)
   rs->next_seq = AIRPLAY_SEQ_CONTINUE;
   rs->pair_type = PAIR_HOMEKIT_NORMAL;
 #if AIRPLAY_USE_PAIRING_TRANSIENT
-  if (re->supports_pairing_transient)
+  // requires_auth will be set if the device returned a 470 RTSP_CONNECTION_AUTH_REQUIRED
+  if (!rd->requires_auth && re->supports_pairing_transient)
     rs->pair_type = PAIR_HOMEKIT_TRANSIENT;
 #endif
 
@@ -2990,6 +2990,9 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs,
 {
   char *pin = arg;
 
+  if (pin)
+    rs->pair_type = PAIR_HOMEKIT_NORMAL;
+
   rs->pair_setup_ctx = pair_setup_new(rs->pair_type, pin, pair_device_id);
   if (!rs->pair_setup_ctx)
     {
@@ -3438,6 +3441,20 @@ response_handler_pair_generic(int step, struct evrtsp_request *req, struct airpl
 static enum airplay_seq_type
 response_handler_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs)
 {
+  struct output_device *device;
+
+  if (rs->pair_type == PAIR_HOMEKIT_TRANSIENT && req->response_code == RTSP_CONNECTION_AUTH_REQUIRED)
+    {
+      device = outputs_device_get(rs->device_id);
+      if (!device)
+	return AIRPLAY_SEQ_ABORT;
+
+      device->requires_auth = 1; // FIXME might be reset by mdns announcement
+      rs->pair_type = PAIR_HOMEKIT_NORMAL;
+
+      return AIRPLAY_SEQ_PIN_START;
+    }
+
   return response_handler_pair_generic(1, req, rs);
 }
 
@@ -3732,7 +3749,8 @@ static struct airplay_seq_request airplay_seq_request[][7] =
     { AIRPLAY_SEQ_PAIR_VERIFY, "pair verify 2", EVRTSP_REQ_POST, payload_make_pair_verify2, response_handler_pair_verify2, "application/octet-stream", "/pair-verify", false },
   },
   {
-    { AIRPLAY_SEQ_PAIR_TRANSIENT, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", false },
+    // Some devices (i.e. my ATV4) gives a 470 when trying transient, so we proceed on that so the handler can trigger PIN setup sequence
+    { AIRPLAY_SEQ_PAIR_TRANSIENT, "pair setup 1", EVRTSP_REQ_POST, payload_make_pair_setup1, response_handler_pair_setup1, "application/octet-stream", "/pair-setup", true },
     { AIRPLAY_SEQ_PAIR_TRANSIENT, "pair setup 2", EVRTSP_REQ_POST, payload_make_pair_setup2, response_handler_pair_setup2, "application/octet-stream", "/pair-setup", false },
   },
   {
@@ -4061,9 +4079,10 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
   if (keyval_get(&features, "Authentication_8"))
     re->supports_auth_setup = 1;
-  if (keyval_get(&features, "SupportsTransient"))
+
+  if (keyval_get(&features, "SupportsSystemPairing") || keyval_get(&features, "SupportsCoreUtilsPairingAndEncryption"))
     re->supports_pairing_transient = 1;
-  if (keyval_get(&features, "SupportsHKPairingAndAccessControl"))
+  else if (keyval_get(&features, "SupportsHKPairingAndAccessControl"))
     rd->requires_auth = 1;
 
   keyval_clear(&features);

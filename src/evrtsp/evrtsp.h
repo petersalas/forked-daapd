@@ -45,8 +45,9 @@ extern "C" {
 
 /* Response codes */
 #define RTSP_OK			200
-#define RTSP_UNAUTHORIZED       401
-#define RTSP_FORBIDDEN          403
+#define RTSP_UNAUTHORIZED              401
+#define RTSP_FORBIDDEN                 403
+#define RTSP_CONNECTION_AUTH_REQUIRED  470
 
 struct evrtsp_connection;
 
