@@ -2726,7 +2726,7 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_uint(stream, "latencyMin", 11025);
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
   wplist_dict_add_uint(stream, "spf", 352); // frames per packet
-  wplist_dict_add_uint(stream, "sr", 44100); // sample rate
+  wplist_dict_add_uint(stream, "sr", RAOP_QUALITY_SAMPLE_RATE_DEFAULT); // sample rate
   wplist_dict_add_uint(stream, "type", RAOP_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
   wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
   wplist_dict_add_uint(stream, "streamConnectionID", rs->session_id); // Hopefully fine since we have one stream per session
