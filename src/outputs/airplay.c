@@ -227,6 +227,7 @@ struct airplay_session
   int reqs_in_flight;
   int cseq;
   char *session;
+  uint32_t session_id;
   char session_url[128];
 
   char *realm;
@@ -884,7 +885,6 @@ session_url_set(struct airplay_session *rs)
   char *intf;
   unsigned short port;
   int family;
-  uint32_t session_id;
   int ret;
 
   // Determine local address, needed for SDP and session URL
@@ -905,12 +905,12 @@ session_url_set(struct airplay_session *rs)
   DPRINTF(E_DBG, L_RAOP, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
 
   // Session ID and session URL
-  gcry_randomize(&session_id, sizeof(session_id), GCRY_STRONG_RANDOM);
+  gcry_randomize(&rs->session_id, sizeof(rs->session_id), GCRY_STRONG_RANDOM);
 
   if (family == AF_INET)
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, session_id);
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, rs->session_id);
   else
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, session_id);
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, rs->session_id);
   if ((ret < 0) || (ret >= sizeof(rs->session_url)))
     {
       DPRINTF(E_LOG, L_RAOP, "Session URL length exceeds 127 characters\n");
@@ -2726,8 +2726,10 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_uint(stream, "latencyMin", 11025);
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
   wplist_dict_add_uint(stream, "spf", 352); // frames per packet
-  wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
+  wplist_dict_add_uint(stream, "sr", 44100); // sample rate
   wplist_dict_add_uint(stream, "type", RAOP_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
+  wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
+  wplist_dict_add_uint(stream, "streamConnectionID", rs->session_id); // Hopefully fine since we have one stream per session
   streams = plist_new_array();
   plist_array_append_item(streams, stream);
 
