@@ -4952,7 +4952,7 @@ raop_deinit(void)
 
 struct output_definition output_raop =
 {
-  .name = "AirPlay",
+  .name = "AirPlay 1",
   .type = OUTPUT_TYPE_RAOP,
 #ifdef PREFER_AIRPLAY2
   .priority = 2,
