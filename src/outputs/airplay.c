@@ -67,34 +67,34 @@
 
 #define ALAC_HEADER_LEN                      3
 
-#define RAOP_QUALITY_SAMPLE_RATE_DEFAULT     44100
-#define RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
-#define RAOP_QUALITY_CHANNELS_DEFAULT        2
+#define AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT     44100
+#define AIRPLAY_QUALITY_BITS_PER_SAMPLE_DEFAULT 16
+#define AIRPLAY_QUALITY_CHANNELS_DEFAULT        2
 
 // AirTunes v2 number of samples per packet
 // Probably using this value because 44100/352 and 48000/352 has good 32 byte
 // alignment, which improves performance of some encoders
-#define RAOP_SAMPLES_PER_PACKET              352
+#define AIRPLAY_SAMPLES_PER_PACKET              352
 
-#define RAOP_RTP_PAYLOADTYPE                 0x60
+#define AIRPLAY_RTP_PAYLOADTYPE                 0x60
 
 // How many RTP packets keep in a buffer for retransmission
-#define RAOP_PACKET_BUFFER_SIZE    1000
+#define AIRPLAY_PACKET_BUFFER_SIZE    1000
 
-#define RAOP_MD_DELAY_STARTUP      15360
-#define RAOP_MD_DELAY_SWITCH       (RAOP_MD_DELAY_STARTUP * 2)
-#define RAOP_MD_WANTS_TEXT         (1 << 0)
-#define RAOP_MD_WANTS_ARTWORK      (1 << 1)
-#define RAOP_MD_WANTS_PROGRESS     (1 << 2)
+#define AIRPLAY_MD_DELAY_STARTUP      15360
+#define AIRPLAY_MD_DELAY_SWITCH       (AIRPLAY_MD_DELAY_STARTUP * 2)
+#define AIRPLAY_MD_WANTS_TEXT         (1 << 0)
+#define AIRPLAY_MD_WANTS_ARTWORK      (1 << 1)
+#define AIRPLAY_MD_WANTS_PROGRESS     (1 << 2)
 
 // ATV4 and Homepod disconnect for reasons that are not clear, but sending them
 // progress metadata at regular intervals reduces the problem. The below
 // interval was determined via testing, see:
 // https://github.com/ejurgensen/forked-daapd/issues/734#issuecomment-622959334
-#define RAOP_KEEP_ALIVE_INTERVAL   25
+#define AIRPLAY_KEEP_ALIVE_INTERVAL   25
 
 // This is an arbitrary value which just needs to be kept in sync with the config
-#define RAOP_CONFIG_MAX_VOLUME     11
+#define AIRPLAY_CONFIG_MAX_VOLUME     11
 
 const char *pair_device_id = "AABBCCDD11223344"; // TODO use actual ID
 
@@ -106,14 +106,14 @@ union sockaddr_all
   struct sockaddr_storage ss;
 };
 
+/* Keep in sync with const char *airplay_devtype */
 enum airplay_devtype {
-  RAOP_DEV_APEX1_80211G,
-  RAOP_DEV_APEX2_80211N,
-  RAOP_DEV_APEX3_80211N,
-  RAOP_DEV_APPLETV,
-  RAOP_DEV_APPLETV4,
-  RAOP_DEV_HOMEPOD,
-  RAOP_DEV_OTHER,
+  AIRPLAY_DEV_APEX2_80211N,
+  AIRPLAY_DEV_APEX3_80211N,
+  AIRPLAY_DEV_APPLETV,
+  AIRPLAY_DEV_APPLETV4,
+  AIRPLAY_DEV_HOMEPOD,
+  AIRPLAY_DEV_OTHER,
 };
 
 // Session is starting up
@@ -174,7 +174,6 @@ struct airplay_extra
   enum airplay_devtype devtype;
 
   uint16_t wanted_metadata;
-  bool encrypt;
   bool supports_auth_setup;
   bool supports_pairing_transient;
 };
@@ -191,7 +190,6 @@ struct airplay_master_session
   uint8_t *rawbuf;
   size_t rawbuf_size;
   int samples_per_packet;
-  bool encrypt;
 
   // Number of samples that we tell the output to buffer (this will mean that
   // the position that we send in the sync packages are offset by this amount
@@ -217,8 +215,6 @@ struct airplay_session
 
   uint16_t wanted_metadata;
   bool req_has_auth;
-  bool encrypt;
-  bool auth_quirk_itunes;
   bool supports_post;
   bool supports_auth_setup;
 
@@ -392,7 +388,6 @@ static const struct features_type_map features_map[] =
 /* Keep in sync with enum airplay_devtype */
 static const char *airplay_devtype[] =
 {
-  "AirPort Express 1 - 802.11g",
   "AirPort Express 2 - 802.11n",
   "AirPort Express 3 - 802.11n",
   "AppleTV",
@@ -404,9 +399,9 @@ static const char *airplay_devtype[] =
 /* Struct with default quality levels */
 static struct media_quality airplay_quality_default =
 {
-  RAOP_QUALITY_SAMPLE_RATE_DEFAULT,
-  RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT,
-  RAOP_QUALITY_CHANNELS_DEFAULT
+  AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT,
+  AIRPLAY_QUALITY_BITS_PER_SAMPLE_DEFAULT,
+  AIRPLAY_QUALITY_CHANNELS_DEFAULT
 };
 
 /* From player.c */
@@ -425,7 +420,7 @@ static struct output_metadata *airplay_cur_metadata;
 
 /* Keep-alive timer - hack for ATV's with tvOS 10 */
 static struct event *keep_alive_timer;
-static struct timeval keep_alive_tv = { RAOP_KEEP_ALIVE_INTERVAL, 0 };
+static struct timeval keep_alive_tv = { AIRPLAY_KEEP_ALIVE_INTERVAL, 0 };
 
 /* Sessions */
 static struct airplay_master_session *airplay_master_sessions;
@@ -559,7 +554,7 @@ airplay_timing_get_clock_ntp(struct ntp_stamp *ns)
 }
 
 
-/* ----------------------- RAOP crypto stuff - from VLC --------------------- */
+/* ------------------------------- Crypto ----------------------------------- */
 
 static int
 encrypt_chacha(uint8_t *cipher, uint8_t *plain, size_t plain_len, const uint8_t *key, size_t key_len, const void *ad, size_t ad_len, uint8_t *tag, size_t tag_len, uint8_t *nonce, size_t nonce_len)
@@ -593,8 +588,9 @@ encrypt_chacha(uint8_t *cipher, uint8_t *plain, size_t plain_len, const uint8_t 
 }
 
 
-/* ------------------ Helpers for sending RAOP/RTSP requests ---------------- */
+/* --------------------- Helpers for sending RTSP requests ------------------ */
 
+// TODO Not sure if the below is still valid for AirPlay 2
 static int
 request_header_auth_add(struct evrtsp_request *req, struct airplay_session *rs, const char *method, const char *uri)
 {
@@ -623,16 +619,8 @@ request_header_auth_add(struct evrtsp_request *req, struct airplay_session *rs, 
       return -2;
     }
 
-  if (rs->auth_quirk_itunes)
-    {
-      hash_fmt = "%02X"; /* Uppercase hex */
-      username = "iTunes";
-    }
-  else
-    {
-      hash_fmt = "%02x";
-      username = ""; /* No username */
-    }
+  hash_fmt = "%02x";
+  username = ""; /* No username */
 
   gc_err = gcry_md_open(&hd, GCRY_MD_MD5, 0);
   if (gc_err != GPG_ERR_NO_ERROR)
@@ -962,7 +950,7 @@ metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_
   //       or getting out of a pause or seeking
   // - end is the RTP time of the last sample for this song
   len_samples     = (int64_t)metadata->len_ms * sample_rate / 1000;
-  *display        = metadata->startup ? *start - RAOP_MD_DELAY_STARTUP : *start - RAOP_MD_DELAY_SWITCH;
+  *display        = metadata->startup ? *start - AIRPLAY_MD_DELAY_STARTUP : *start - AIRPLAY_MD_DELAY_SWITCH;
   *pos            = MAX(rms->cur_stamp.pos, *start);
   *end            = len_samples ? *start + len_samples : *pos;
 
@@ -1078,7 +1066,7 @@ session_status(struct airplay_session *rs)
 }
 
 static struct airplay_master_session *
-master_session_make(struct media_quality *quality, bool encrypt)
+master_session_make(struct media_quality *quality)
 {
   struct airplay_master_session *rms;
   int ret;
@@ -1086,7 +1074,7 @@ master_session_make(struct media_quality *quality, bool encrypt)
   // First check if we already have a suitable session
   for (rms = airplay_master_sessions; rms; rms = rms->next)
     {
-      if (encrypt == rms->encrypt && quality_is_equal(quality, &rms->rtp_session->quality))
+      if (quality_is_equal(quality, &rms->rtp_session->quality))
 	return rms;
     }
 
@@ -1100,7 +1088,7 @@ master_session_make(struct media_quality *quality, bool encrypt)
 
   CHECK_NULL(L_AIRPLAY, rms = calloc(1, sizeof(struct airplay_master_session)));
 
-  rms->rtp_session = rtp_session_new(quality, RAOP_PACKET_BUFFER_SIZE, 0);
+  rms->rtp_session = rtp_session_new(quality, AIRPLAY_PACKET_BUFFER_SIZE, 0);
   if (!rms->rtp_session)
     {
       outputs_quality_unsubscribe(quality);
@@ -1108,8 +1096,7 @@ master_session_make(struct media_quality *quality, bool encrypt)
       return NULL;
     }
 
-  rms->encrypt = encrypt;
-  rms->samples_per_packet = RAOP_SAMPLES_PER_PACKET;
+  rms->samples_per_packet = AIRPLAY_SAMPLES_PER_PACKET;
   rms->rawbuf_size = STOB(rms->samples_per_packet, quality->bits_per_sample, quality->channels);
   rms->output_buffer_samples = OUTPUTS_BUFFER_DURATION * quality->sample_rate;
 
@@ -1417,38 +1404,6 @@ session_make(struct output_device *rd, int callback_id)
     rs->pair_type = PAIR_HOMEKIT_TRANSIENT;
 #endif
 
-  switch (re->devtype)
-    {
-      case RAOP_DEV_APEX1_80211G:
-	rs->encrypt = 1;
-	rs->auth_quirk_itunes = 1;
-	break;
-
-      case RAOP_DEV_APEX2_80211N:
-	rs->encrypt = 1;
-	rs->auth_quirk_itunes = 0;
-	break;
-
-      case RAOP_DEV_APEX3_80211N:
-	rs->encrypt = 0;
-	rs->auth_quirk_itunes = 0;
-	break;
-
-      case RAOP_DEV_APPLETV:
-	rs->encrypt = 0;
-	rs->auth_quirk_itunes = 0;
-	break;
-
-      case RAOP_DEV_APPLETV4:
-	rs->encrypt = 0;
-	rs->auth_quirk_itunes = 0;
-	break;
-
-      default:
-	rs->encrypt = re->encrypt;
-	rs->auth_quirk_itunes = 0;
-    }
-
   ret = session_connection_setup(rs, rd, AF_INET6);
   if (ret < 0)
     {
@@ -1457,7 +1412,7 @@ session_make(struct output_device *rd, int callback_id)
 	goto error;
     }
 
-  rs->master_session = master_session_make(&rd->quality, rs->encrypt);
+  rs->master_session = master_session_make(&rd->quality);
   if (!rs->master_session)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", rd->name);
@@ -1556,13 +1511,13 @@ airplay_metadata_send_generic(struct airplay_session *rs, struct output_metadata
 {
   struct airplay_metadata *rmd = metadata->priv;
 
-  if (rs->wanted_metadata & RAOP_MD_WANTS_PROGRESS)
+  if (rs->wanted_metadata & AIRPLAY_MD_WANTS_PROGRESS)
     sequence_start(AIRPLAY_SEQ_SEND_PROGRESS, rs, metadata, "SET_PARAMETER (progress)");
 
-  if (!only_progress && (rs->wanted_metadata & RAOP_MD_WANTS_TEXT))
+  if (!only_progress && (rs->wanted_metadata & AIRPLAY_MD_WANTS_TEXT))
     sequence_start(AIRPLAY_SEQ_SEND_TEXT, rs, metadata, "SET_PARAMETER (text)");
 
-  if (!only_progress && (rs->wanted_metadata & RAOP_MD_WANTS_ARTWORK) && rmd->artwork)
+  if (!only_progress && (rs->wanted_metadata & AIRPLAY_MD_WANTS_ARTWORK) && rmd->artwork)
     sequence_start(AIRPLAY_SEQ_SEND_ARTWORK, rs, metadata, "SET_PARAMETER (artwork)");
 
   return 0;
@@ -1622,17 +1577,17 @@ airplay_volume_from_pct(int volume, char *name)
   cfg_t *airplay;
   int max_volume;
 
-  max_volume = RAOP_CONFIG_MAX_VOLUME;
+  max_volume = AIRPLAY_CONFIG_MAX_VOLUME;
 
   airplay = cfg_gettsec(cfg, "airplay", name);
   if (airplay)
     max_volume = cfg_getint(airplay, "max_volume");
 
-  if ((max_volume < 1) || (max_volume > RAOP_CONFIG_MAX_VOLUME))
+  if ((max_volume < 1) || (max_volume > AIRPLAY_CONFIG_MAX_VOLUME))
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Config has bad max_volume (%d) for device '%s', using default instead\n", max_volume, name);
 
-      max_volume = RAOP_CONFIG_MAX_VOLUME;
+      max_volume = AIRPLAY_CONFIG_MAX_VOLUME;
     }
 
   /* RAOP volume
@@ -1640,7 +1595,7 @@ airplay_volume_from_pct(int volume, char *name)
    *  0 - 100 maps to -30.0 - 0
    */
   if (volume > 0 && volume <= 100)
-    airplay_volume = -30.0 + ((float)max_volume * (float)volume * 30.0) / (100.0 * RAOP_CONFIG_MAX_VOLUME);
+    airplay_volume = -30.0 + ((float)max_volume * (float)volume * 30.0) / (100.0 * AIRPLAY_CONFIG_MAX_VOLUME);
   else
     airplay_volume = -144.0;
 
@@ -1659,25 +1614,25 @@ airplay_volume_to_pct(struct output_device *rd, const char *volume)
   // Basic sanity check
   if (airplay_volume == 0.0 && volume[0] != '0')
     {
-      DPRINTF(E_LOG, L_AIRPLAY, "RAOP device volume is invalid: '%s'\n", volume);
+      DPRINTF(E_LOG, L_AIRPLAY, "AirPlay device volume is invalid: '%s'\n", volume);
       return -1;
     }
 
-  max_volume = RAOP_CONFIG_MAX_VOLUME;
+  max_volume = AIRPLAY_CONFIG_MAX_VOLUME;
 
   airplay = cfg_gettsec(cfg, "airplay", rd->name);
   if (airplay)
     max_volume = cfg_getint(airplay, "max_volume");
 
-  if ((max_volume < 1) || (max_volume > RAOP_CONFIG_MAX_VOLUME))
+  if ((max_volume < 1) || (max_volume > AIRPLAY_CONFIG_MAX_VOLUME))
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Config has bad max_volume (%d) for device '%s', using default instead\n", max_volume, rd->name);
-      max_volume = RAOP_CONFIG_MAX_VOLUME;
+      max_volume = AIRPLAY_CONFIG_MAX_VOLUME;
     }
 
   // RAOP volume: -144.0 is off, -30.0 - 0 scaled by max_volume maps to 0 - 100
   if (airplay_volume > -30.0 && airplay_volume <= 0.0)
-    return (int)(100.0 * (airplay_volume / 30.0 + 1.0) * RAOP_CONFIG_MAX_VOLUME / (float)max_volume);
+    return (int)(100.0 * (airplay_volume / 30.0 + 1.0) * AIRPLAY_CONFIG_MAX_VOLUME / (float)max_volume);
   else
     return 0;
 }
@@ -1866,7 +1821,7 @@ packets_send(struct airplay_master_session *rms)
   struct rtp_packet *pkt;
   struct airplay_session *rs;
 
-  pkt = rtp_packet_next(rms->rtp_session, ALAC_HEADER_LEN + rms->rawbuf_size, rms->samples_per_packet, RAOP_RTP_PAYLOADTYPE, 0);
+  pkt = rtp_packet_next(rms->rtp_session, ALAC_HEADER_LEN + rms->rawbuf_size, rms->samples_per_packet, AIRPLAY_RTP_PAYLOADTYPE, 0);
 
   alac_encode(pkt->payload, rms->rawbuf, rms->rawbuf_size);
 
@@ -1878,12 +1833,12 @@ packets_send(struct airplay_master_session *rms)
       // Device just joined
       if (rs->state == AIRPLAY_STATE_CONNECTED)
 	{
-	  pkt->header[1] = (1 << 7) | RAOP_RTP_PAYLOADTYPE;
+	  pkt->header[1] = (1 << 7) | AIRPLAY_RTP_PAYLOADTYPE;
 	  packet_send(rs, pkt);
 	}
       else if (rs->state == AIRPLAY_STATE_STREAMING)
 	{
-	  pkt->header[1] = RAOP_RTP_PAYLOADTYPE;
+	  pkt->header[1] = AIRPLAY_RTP_PAYLOADTYPE;
 	  packet_send(rs, pkt);
 	}
     }
@@ -2292,9 +2247,9 @@ airplay_control_cb(int fd, short what, void *arg)
   if (!rs)
     {
       if (!ret)
-	DPRINTF(E_LOG, L_AIRPLAY, "Control request from [error: %s]; not a RAOP client\n", strerror(errno));
+	DPRINTF(E_LOG, L_AIRPLAY, "Control request from [error: %s]; not an AirPlay client\n", strerror(errno));
       else
-	DPRINTF(E_LOG, L_AIRPLAY, "Control request from %s; not a RAOP client\n", address);
+	DPRINTF(E_LOG, L_AIRPLAY, "Control request from %s; not an AirPlay client\n", address);
 
       goto readd;
     }
@@ -2507,7 +2462,7 @@ event_channel_cb(int fd, short what, void *arg)
 }
 
 
-/* ----------------- Handlers for sending RAOP/RTSP requests ---------------- */
+/* -------------------- Handlers for sending RTSP requests ------------------ */
 
 static int
 payload_make_flush(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
@@ -2710,8 +2665,8 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_uint(stream, "latencyMin", 11025);
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
   wplist_dict_add_uint(stream, "spf", 352); // frames per packet
-  wplist_dict_add_uint(stream, "sr", RAOP_QUALITY_SAMPLE_RATE_DEFAULT); // sample rate
-  wplist_dict_add_uint(stream, "type", RAOP_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
+  wplist_dict_add_uint(stream, "sr", AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT); // sample rate
+  wplist_dict_add_uint(stream, "type", AIRPLAY_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
   wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
   wplist_dict_add_uint(stream, "streamConnectionID", rs->session_id); // Hopefully fine since we have one stream per session
   streams = plist_new_array();
@@ -3157,7 +3112,7 @@ response_handler_record(struct evrtsp_request *req, struct airplay_session *rs)
   if (!param)
     DPRINTF(E_INFO, L_AIRPLAY, "RECORD reply from '%s' did not have an Audio-Latency header\n", rs->devname);
   else
-    DPRINTF(E_DBG, L_AIRPLAY, "RAOP audio latency is %s\n", param);
+    DPRINTF(E_DBG, L_AIRPLAY, "AirPlay audio latency is %s\n", param);
 
   rs->state = AIRPLAY_STATE_RECORD;
 
@@ -3664,7 +3619,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
  *   called for error handling (req == NULL or HTTP error code)
  * - if rs->reqs_in_flight == 0, setup evrtsp connection closecb
  *
- * When a request fails, the whole RAOP session is declared failed and
+ * When a request fails, the whole AirPlay session is declared failed and
  * torn down by calling session_failure(), even if there are requests
  * queued on the evrtsp connection. There is no reason to think pending
  * requests would work out better than the one that just failed and recovery
@@ -4080,11 +4035,11 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     }
 
   if (keyval_get(&features_kv, "MetadataFeatures_0"))
-    re->wanted_metadata |= RAOP_MD_WANTS_ARTWORK;
+    re->wanted_metadata |= AIRPLAY_MD_WANTS_ARTWORK;
   if (keyval_get(&features_kv, "MetadataFeatures_1"))
-    re->wanted_metadata |= RAOP_MD_WANTS_PROGRESS;
+    re->wanted_metadata |= AIRPLAY_MD_WANTS_PROGRESS;
   if (keyval_get(&features_kv, "MetadataFeatures_2"))
-    re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
+    re->wanted_metadata |= AIRPLAY_MD_WANTS_TEXT;
   if (keyval_get(&features_kv, "Authentication_8"))
     re->supports_auth_setup = 1;
 
@@ -4096,29 +4051,29 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
   keyval_clear(&features_kv);
 
   // Only default audio quality supported so far
-  rd->quality.sample_rate = RAOP_QUALITY_SAMPLE_RATE_DEFAULT;
-  rd->quality.bits_per_sample = RAOP_QUALITY_BITS_PER_SAMPLE_DEFAULT;
-  rd->quality.channels = RAOP_QUALITY_CHANNELS_DEFAULT;
+  rd->quality.sample_rate = AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT;
+  rd->quality.bits_per_sample = AIRPLAY_QUALITY_BITS_PER_SAMPLE_DEFAULT;
+  rd->quality.channels = AIRPLAY_QUALITY_CHANNELS_DEFAULT;
 
   if (!quality_is_equal(&rd->quality, &airplay_quality_default))
     DPRINTF(E_LOG, L_AIRPLAY, "Device '%s' requested non-default audio quality (%d/%d/%d)\n", rd->name, rd->quality.sample_rate, rd->quality.bits_per_sample, rd->quality.channels);
 
   // Device type
-  re->devtype = RAOP_DEV_OTHER;
+  re->devtype = AIRPLAY_DEV_OTHER;
   p = keyval_get(txt, "model");
 
   if (!p)
-    re->devtype = RAOP_DEV_APEX1_80211G; // First generation AirPort Express
+    re->devtype = AIRPLAY_DEV_OTHER;
   else if (strncmp(p, "AirPort4", strlen("AirPort4")) == 0)
-    re->devtype = RAOP_DEV_APEX2_80211N; // Second generation
+    re->devtype = AIRPLAY_DEV_APEX2_80211N; // Second generation
   else if (strncmp(p, "AirPort", strlen("AirPort")) == 0)
-    re->devtype = RAOP_DEV_APEX3_80211N; // Third generation and newer
+    re->devtype = AIRPLAY_DEV_APEX3_80211N; // Third generation and newer
   else if (strncmp(p, "AppleTV5,3", strlen("AppleTV5,3")) == 0)
-    re->devtype = RAOP_DEV_APPLETV4; // Stream to ATV with tvOS 10 needs to be kept alive
+    re->devtype = AIRPLAY_DEV_APPLETV4; // Stream to ATV with tvOS 10 needs to be kept alive
   else if (strncmp(p, "AppleTV", strlen("AppleTV")) == 0)
-    re->devtype = RAOP_DEV_APPLETV;
+    re->devtype = AIRPLAY_DEV_APPLETV;
   else if (strncmp(p, "AudioAccessory", strlen("AudioAccessory")) == 0)
-    re->devtype = RAOP_DEV_HOMEPOD;
+    re->devtype = AIRPLAY_DEV_HOMEPOD;
   else if (*p == '\0')
     DPRINTF(E_LOG, L_AIRPLAY, "AirPlay device '%s': am has no value\n", name);
 
@@ -4128,7 +4083,7 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
   if (cfgopt && cfgopt->nvalues == 1)
     rd->resurrect = cfg_opt_getnbool(cfgopt, 0);
   else
-    rd->resurrect = (re->devtype == RAOP_DEV_APPLETV4) || (re->devtype == RAOP_DEV_HOMEPOD);
+    rd->resurrect = (re->devtype == AIRPLAY_DEV_APPLETV4) || (re->devtype == AIRPLAY_DEV_HOMEPOD);
 
   switch (family)
     {
