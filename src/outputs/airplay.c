@@ -96,8 +96,6 @@
 // This is an arbitrary value which just needs to be kept in sync with the config
 #define AIRPLAY_CONFIG_MAX_VOLUME     11
 
-const char *pair_device_id = "AABBCCDD11223344"; // TODO use actual ID
-
 union sockaddr_all
 {
   struct sockaddr_in sin;
@@ -958,7 +956,6 @@ metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_
     *start, *display, *pos, *end, rtp_session->pos, rms->cur_stamp.pos);
 }
 
-// TODO not clear if Airplay 2 uses this header
 static int
 rtpinfo_header_add(struct evrtsp_request *req, struct airplay_session *rs, struct output_metadata *metadata)
 {
@@ -2930,11 +2927,14 @@ static int
 payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
   char *pin = arg;
+  char device_id_hex[16 + 1];
 
   if (pin)
     rs->pair_type = PAIR_HOMEKIT_NORMAL;
 
-  rs->pair_setup_ctx = pair_setup_new(rs->pair_type, pin, pair_device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", rs->device_id);
+
+  rs->pair_setup_ctx = pair_setup_new(rs->pair_type, pin, device_id_hex);
   if (!rs->pair_setup_ctx)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Out of memory for verification setup context\n");
@@ -2962,12 +2962,15 @@ static int
 payload_make_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
   struct output_device *device;
+  char device_id_hex[16 + 1];
 
   device = outputs_device_get(rs->device_id);
   if (!device)
     return -1;
 
-  rs->pair_verify_ctx = pair_verify_new(rs->pair_type, device->auth_key, pair_device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", rs->device_id);
+
+  rs->pair_verify_ctx = pair_verify_new(rs->pair_type, device->auth_key, device_id_hex);
   if (!rs->pair_verify_ctx)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Out of memory for verification verify context\n");
@@ -3206,7 +3209,7 @@ response_handler_volume_start(struct evrtsp_request *req, struct airplay_session
 {
   int ret;
 
-  ret = airplay_metadata_startup_send(rs); // TODO Should this be added to the startup sequence?
+  ret = airplay_metadata_startup_send(rs);
   if (ret < 0)
     return AIRPLAY_SEQ_ABORT;
 
