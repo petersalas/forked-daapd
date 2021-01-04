@@ -3981,10 +3981,11 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
 {
   struct output_device *rd;
   struct airplay_extra *re;
-  struct keyval features = { 0 };
+  struct keyval features_kv = { 0 };
   cfg_t *devcfg;
   cfg_opt_t *cfgopt;
   const char *p;
+  const char *features;
   char *s;
   char *ptr;
   uint64_t id;
@@ -4061,38 +4062,38 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     }
 
   // Features, see features_map[]
-  p = keyval_get(txt, "features");
-  if (!p || !strchr(p, ','))
+  features = keyval_get(txt, "features");
+  if (!features || !strchr(features, ','))
     {
       DPRINTF(E_LOG, L_AIRPLAY, "AirPlay device '%s' error: Missing/unexpected 'features' in TXT field\n", name);
       goto free_rd;
     }
 
-  ret = features_parse(&features, p, strchr(p, ',') + 1, name);
+  ret = features_parse(&features_kv, features, strchr(features, ',') + 1, name);
   if (ret < 0)
     goto free_rd;
 
-  if (!keyval_get(&features, "SupportsAirPlayAudio"))
+  if (!keyval_get(&features_kv, "SupportsAirPlayAudio"))
     {
       DPRINTF(E_LOG, L_AIRPLAY, "AirPlay device '%s' does not support audio\n", name);
       goto free_rd;
     }
 
-  if (keyval_get(&features, "MetadataFeatures_0"))
+  if (keyval_get(&features_kv, "MetadataFeatures_0"))
     re->wanted_metadata |= RAOP_MD_WANTS_ARTWORK;
-  if (keyval_get(&features, "MetadataFeatures_1"))
+  if (keyval_get(&features_kv, "MetadataFeatures_1"))
     re->wanted_metadata |= RAOP_MD_WANTS_PROGRESS;
-  if (keyval_get(&features, "MetadataFeatures_2"))
+  if (keyval_get(&features_kv, "MetadataFeatures_2"))
     re->wanted_metadata |= RAOP_MD_WANTS_TEXT;
-  if (keyval_get(&features, "Authentication_8"))
+  if (keyval_get(&features_kv, "Authentication_8"))
     re->supports_auth_setup = 1;
 
-  if (keyval_get(&features, "SupportsSystemPairing") || keyval_get(&features, "SupportsCoreUtilsPairingAndEncryption"))
+  if (keyval_get(&features_kv, "SupportsSystemPairing") || keyval_get(&features_kv, "SupportsCoreUtilsPairingAndEncryption"))
     re->supports_pairing_transient = 1;
-  else if (keyval_get(&features, "SupportsHKPairingAndAccessControl"))
+  else if (keyval_get(&features_kv, "SupportsHKPairingAndAccessControl"))
     rd->requires_auth = 1;
 
-  keyval_clear(&features);
+  keyval_clear(&features_kv);
 
   // Only default audio quality supported so far
   rd->quality.sample_rate = RAOP_QUALITY_SAMPLE_RATE_DEFAULT;
@@ -4134,15 +4135,15 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
       case AF_INET:
 	rd->v4_address = strdup(address);
 	rd->v4_port = port;
-	DPRINTF(E_INFO, L_AIRPLAY, "Adding AirPlay device '%s': password: %u, verification: %u, encrypt: %u, authsetup: %u, metadata: %u, type %s, address %s:%d\n", 
-	  name, rd->has_password, rd->requires_auth, re->encrypt, re->supports_auth_setup, re->wanted_metadata, airplay_devtype[re->devtype], address, port);
+	DPRINTF(E_INFO, L_AIRPLAY, "Adding AirPlay device '%s': features %s, type %s, address %s:%d\n", 
+	  name, features, airplay_devtype[re->devtype], address, port);
 	break;
 
       case AF_INET6:
 	rd->v6_address = strdup(address);
 	rd->v6_port = port;
-	DPRINTF(E_INFO, L_AIRPLAY, "Adding AirPlay device '%s': password: %u, verification: %u, encrypt: %u, authsetup: %u, metadata: %u, type %s, address [%s]:%d\n", 
-	  name, rd->has_password, rd->requires_auth, re->encrypt, re->supports_auth_setup, re->wanted_metadata, airplay_devtype[re->devtype], address, port);
+	DPRINTF(E_INFO, L_AIRPLAY, "Adding AirPlay device '%s': features %s, type %s, address [%s]:%d\n", 
+	  name, features, airplay_devtype[re->devtype], address, port);
 	break;
 
       default:
@@ -4158,7 +4159,7 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
 
  free_rd:
   outputs_device_free(rd);
-  keyval_clear(&features);
+  keyval_clear(&features_kv);
 }
 
 
