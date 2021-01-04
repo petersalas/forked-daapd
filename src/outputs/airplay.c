@@ -205,7 +205,6 @@ struct airplay_session
   struct airplay_master_session *master_session;
 
   struct evrtsp_connection *ctrl;
-  struct evrtsp_connection *event;
 
   enum airplay_state state;
 
@@ -250,7 +249,9 @@ struct airplay_session
   uint8_t shared_secret[32];
 
   int server_fd;
+
   int events_fd;
+  struct event *eventsev;
 
   union sockaddr_all sa;
 
@@ -983,12 +984,14 @@ static void
 rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 {
   struct airplay_session *rs = arg;
+  uint8_t *in;
+  size_t in_len;
   uint8_t *out = NULL;
   size_t out_len = 0;
   int ret;
 
-  uint8_t *in = evbuffer_pullup(evbuf, -1);
-  size_t in_len = evbuffer_get_length(evbuf);
+  in = evbuffer_pullup(evbuf, -1);
+  in_len = evbuffer_get_length(evbuf);
 
   if (encrypt)
     {
@@ -1166,8 +1169,14 @@ session_free(struct airplay_session *rs)
   if (rs->deferredev)
     event_free(rs->deferredev);
 
+  if (rs->eventsev)
+    event_free(rs->eventsev);
+
   if (rs->server_fd >= 0)
     close(rs->server_fd);
+
+  if (rs->events_fd >= 0)
+    close(rs->events_fd);
 
   pair_setup_free(rs->pair_setup_ctx);
   pair_verify_free(rs->pair_verify_ctx);
@@ -1387,6 +1396,7 @@ session_make(struct output_device *rd, int callback_id)
   rs->callback_id = callback_id;
 
   rs->server_fd = -1;
+  rs->events_fd = -1;
 
   rs->password = rd->password;
 
@@ -2425,6 +2435,7 @@ airplay_control_start(int v6enabled)
 
 /* ----------------------------- Event receiver ------------------------------*/
 
+// TODO actually handle events...
 static void
 event_channel_cb(int fd, short what, void *arg)
 {
@@ -2437,13 +2448,12 @@ event_channel_cb(int fd, short what, void *arg)
 
   in_len = recv(fd, in, sizeof(in), 0);
   if (in_len < 0)
-    DPRINTF(E_WARN, L_AIRPLAY, "Possible disconnect from event channel from %s\n", rs->devname);
-    // TODO end session
+    DPRINTF(E_WARN, L_AIRPLAY, "Event channel to '%s' returned an error: %s\n", rs->devname, strerror(errno));
 
   if (in_len <= 0)
     return;
 
-  DPRINTF(E_DBG, L_AIRPLAY, "GOT AN EVENT, len was %zd\n", in_len);
+  DPRINTF(E_DBG, L_AIRPLAY, "Received an event from '%s' (len=%zd)\n", rs->devname, in_len);
 
   if (in_len == sizeof(in))
     return; // Longer than expected, give up
@@ -2451,7 +2461,7 @@ event_channel_cb(int fd, short what, void *arg)
   ret = pair_decrypt(&out, &out_len, in, in_len, rs->events_cipher_ctx);
   if (ret < 0)
     {
-      DPRINTF(E_DBG, L_AIRPLAY, "Decryption error was: %s\n", pair_cipher_errmsg(rs->events_cipher_ctx));
+      DPRINTF(E_DBG, L_AIRPLAY, "Error decrypting event from '%s', error was: %s\n", rs->devname, pair_cipher_errmsg(rs->events_cipher_ctx));
       return;
     }
 
@@ -3190,8 +3200,8 @@ response_handler_setup_stream(struct evrtsp_request *req, struct airplay_session
     }
   else
     {
-      struct event *ev = event_new(evbase_player, rs->events_fd, EV_READ | EV_PERSIST, event_channel_cb, rs); // TODO, possibly use evrtsp instead
-      event_add(ev, NULL);
+      rs->eventsev = event_new(evbase_player, rs->events_fd, EV_READ | EV_PERSIST, event_channel_cb, rs);
+      event_add(rs->eventsev, NULL);
     }
 
   rs->state = AIRPLAY_STATE_SETUP;
