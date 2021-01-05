@@ -425,6 +425,9 @@ static struct timeval keep_alive_tv = { AIRPLAY_KEEP_ALIVE_INTERVAL, 0 };
 static struct airplay_master_session *airplay_master_sessions;
 static struct airplay_session *airplay_sessions;
 
+/* Our own device ID */
+static uint64_t airplay_device_id;
+
 // Forwards
 static int
 airplay_device_start(struct output_device *rd, int callback_id);
@@ -550,6 +553,27 @@ airplay_timing_get_clock_ntp(struct ntp_stamp *ns)
   timespec_to_ntp(&ts, ns);
 
   return 0;
+}
+
+// Converts uint64t libhash -> AA:BB:CC:DD:EE:FF:11:22
+static void
+device_id_colon_make(char *id_str, int size, uint64_t id)
+{
+  int r, w;
+
+  snprintf(id_str, size, "%016" PRIX64, id);
+
+  for (r = strlen(id_str) - 1, w = size - 2; r != w; r--, w--)
+    {
+      id_str[w] = id_str[r];
+      if (r % 2 == 0)
+        {
+	  w--;
+	  id_str[w] = ':';
+	}
+    }
+
+  id_str[size - 1] = 0; // Zero terminate
 }
 
 
@@ -2668,7 +2692,7 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_uint(stream, "controlPort", rs->control_svc->port);
   wplist_dict_add_uint(stream, "ct", 2); // Compression type, 1 LPCM, 2 ALAC, 3 AAC, 4 AAC ELD, 32 OPUS
   wplist_dict_add_bool(stream, "isMedia", true); // ?
-  wplist_dict_add_uint(stream, "latencyMax", 88200);
+  wplist_dict_add_uint(stream, "latencyMax", 88200); // TODO how do these latencys work?
   wplist_dict_add_uint(stream, "latencyMin", 11025);
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
   wplist_dict_add_uint(stream, "spf", 352); // frames per packet
@@ -2777,6 +2801,7 @@ payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *r
 //  plist_t timingpeerlist;
   plist_t addresses;
   plist_t address;
+  char device_id_colon[24];
   uint8_t *data;
   size_t len;
   int ret;
@@ -2787,6 +2812,8 @@ payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *r
       DPRINTF(E_LOG, L_AIRPLAY, "Could not make session url for device '%s'\n", rs->devname);
       return -1;
     }
+
+  device_id_colon_make(device_id_colon, sizeof(device_id_colon), airplay_device_id);
 
   address = plist_new_string(rs->local_address);
   addresses = plist_new_array();
@@ -2803,7 +2830,7 @@ payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *r
   wplist_dict_add_bool(timingpeerlist, "SupportsClockPortMatchingOverride", false);
 */
   root = plist_new_dict();
-//  wplist_dict_add_string(root, "deviceID", "11:22:33:44:55:66");
+  wplist_dict_add_string(root, "deviceID", device_id_colon);
 //  wplist_dict_add_data(root, "eiv", airplay_aes_iv, sizeof(airplay_aes_iv));
 //  wplist_dict_add_data(root, "ekey", airplay_aes_key, sizeof(airplay_aes_key));
 //  wplist_dict_add_uint(root, "et", 0); // No encryption?
@@ -2942,7 +2969,7 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs,
   if (pin)
     rs->pair_type = PAIR_HOMEKIT_NORMAL;
 
-  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", rs->device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", airplay_device_id);
 
   rs->pair_setup_ctx = pair_setup_new(rs->pair_type, pin, device_id_hex);
   if (!rs->pair_setup_ctx)
@@ -2978,7 +3005,7 @@ payload_make_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs
   if (!device)
     return -1;
 
-  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", rs->device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", airplay_device_id);
 
   rs->pair_verify_ctx = pair_verify_new(rs->pair_type, device->auth_key, device_id_hex);
   if (!rs->pair_verify_ctx)
@@ -3118,15 +3145,6 @@ response_handler_pin_start(struct evrtsp_request *req, struct airplay_session *r
 static enum airplay_seq_type
 response_handler_record(struct evrtsp_request *req, struct airplay_session *rs)
 {
-  const char *param;
-
-  /* Audio latency */
-  param = evrtsp_find_header(req->input_headers, "Audio-Latency");
-  if (!param)
-    DPRINTF(E_INFO, L_AIRPLAY, "RECORD reply from '%s' did not have an Audio-Latency header\n", rs->devname);
-  else
-    DPRINTF(E_DBG, L_AIRPLAY, "AirPlay audio latency is %s\n", param);
-
   rs->state = AIRPLAY_STATE_RECORD;
 
   return AIRPLAY_SEQ_CONTINUE;
@@ -4300,6 +4318,8 @@ airplay_init(void)
 
   control_6svc.fd = -1;
   control_6svc.port = 0;
+
+  airplay_device_id = libhash;
 
   // Check alignment of enum seq_type with airplay_seq_definition and
   // airplay_seq_request
