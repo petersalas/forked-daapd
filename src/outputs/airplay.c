@@ -64,6 +64,9 @@
 #define AIRPLAY_USE_STREAMID                 0
 #define AIRPLAY_USE_PAIRING_TRANSIENT        1
 
+// Full traffic dumps and some other stuff
+#define AIRPLAY_EXTENDED_LOGGING             0
+
 
 #define ALAC_HEADER_LEN                      3
 
@@ -1019,31 +1022,43 @@ rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 
   if (encrypt)
     {
+#if AIRPLAY_EXTENDED_LOGGING
       if (in_len < 4096)
 	DHEXDUMP(E_DBG, L_AIRPLAY, in, in_len, "Encrypting outgoing request\n");
       else
 	DPRINTF(E_DBG, L_AIRPLAY, "Encrypting outgoing request (size %zu)\n", in_len);
+#endif
+
       ret = pair_encrypt(&out, &out_len, in, in_len, rs->control_cipher_ctx);
+      if (ret < 0)
+	goto error;
     }
   else
     {
       ret = pair_decrypt(&out, &out_len, in, in_len, rs->control_cipher_ctx);
+      if (ret < 0)
+	goto error;
+
+#if AIRPLAY_EXTENDED_LOGGING
       if (out_len < 4096)
 	DHEXDUMP(E_DBG, L_AIRPLAY, out, out_len, "Decrypted incoming response\n");
       else
 	DPRINTF(E_DBG, L_AIRPLAY, "Decrypted incoming response (size %zu)\n", out_len);
+#endif
     }
 
   evbuffer_drain(evbuf, in_len);
-
-  if (ret < 0)
-    {
-// TODO test this error condition seems that it can lead to a freeze
-      DPRINTF(E_LOG, L_AIRPLAY, "Error while ciphering: %s\n", pair_cipher_errmsg(rs->control_cipher_ctx));
-      return;
-    }
-
   evbuffer_add(evbuf, out, out_len);
+
+  return;
+
+ error:
+  DPRINTF(E_LOG, L_AIRPLAY, "Error while %s (len=%zu): %s\n", encrypt ? "encrypting" : "decrypting", in_len, pair_cipher_errmsg(rs->control_cipher_ctx));
+
+  // This will lead evrtsp to timeout the request, which takes a while, so we
+  // should consider some quicker error handling instead
+  evbuffer_drain(evbuf, in_len);
+  return;
 }
 
 
@@ -3924,8 +3939,6 @@ features_parse(struct keyval *features_kv, const char *fs1, const char *fs2, con
       return -1;
     }
 
-  DPRINTF(E_DBG, L_AIRPLAY, "Parsing features flags from AirPlay '%s': %s (%" PRIu64 ")\n", name, fs1, features);
-
   // Walk through the bits
   for (i = 0; i < (sizeof(features) * CHAR_BIT); i++)
     {
@@ -3937,14 +3950,18 @@ features_parse(struct keyval *features_kv, const char *fs1, const char *fs2, con
 	{
 	  if (i == features_map[j].bit)
 	    {
+#if AIRPLAY_EXTENDED_LOGGING
 	      DPRINTF(E_DBG, L_AIRPLAY, "Speaker '%s' announced feature %d: '%s'\n", name, i, features_map[j].name);
+#endif
               keyval_add(features_kv, features_map[j].name, "1");
 	      break;
 	    }
 	}
 
+#if AIRPLAY_EXTENDED_LOGGING
       if (j == ARRAY_SIZE(features_map))
 	DPRINTF(E_DBG, L_AIRPLAY, "Speaker '%s' announced feature %d: 'Unknown'\n", name, i);
+#endif
     }
 
   return 0;
