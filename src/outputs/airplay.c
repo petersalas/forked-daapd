@@ -59,13 +59,22 @@
 
 #include "pair.h"
 
+/* List of TODO's for AirPlay 2
+ *
+ * inplace encryption
+ * keep chacha encryptor open
+ * latency needs different handling
+ * support ipv6, e.g. in SETPEERS
+ * ffmpeg alac encoding
+ */
+
 // Airplay 2 has a gazallion parameters, many of them unknown to us. With the
 // below it is possible to easily try different variations.
 #define AIRPLAY_USE_STREAMID                 0
 #define AIRPLAY_USE_PAIRING_TRANSIENT        1
 
 // Full traffic dumps and some other stuff
-#define AIRPLAY_EXTENDED_LOGGING             0
+#define AIRPLAY_EXTENDED_LOGGING             1
 
 
 #define ALAC_HEADER_LEN                      3
@@ -225,6 +234,7 @@ struct airplay_session
   char *session;
   uint32_t session_id;
   char session_url[128];
+  char session_uuid[37];
 
   char *realm;
   char *nonce;
@@ -901,7 +911,7 @@ session_url_set(struct airplay_session *rs)
   int family;
   int ret;
 
-  // Determine local address, needed for SDP and session URL
+  // Determine local address, needed for session URL
   evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
   if (!address || (port == 0))
     {
@@ -918,7 +928,9 @@ session_url_set(struct airplay_session *rs)
 
   DPRINTF(E_DBG, L_AIRPLAY, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
 
-  // Session ID and session URL
+  // Session UUID, ID and session URL
+  uuid_make(rs->session_uuid);
+
   gcry_randomize(&rs->session_id, sizeof(rs->session_id), GCRY_STRONG_RANDOM);
 
   if (family == AF_INET)
@@ -2710,7 +2722,7 @@ payload_make_setup_stream(struct evrtsp_request *req, struct airplay_session *rs
   wplist_dict_add_uint(stream, "latencyMax", 88200); // TODO how do these latencys work?
   wplist_dict_add_uint(stream, "latencyMin", 11025);
   wplist_dict_add_data(stream, "shk", rs->shared_secret, sizeof(rs->shared_secret));
-  wplist_dict_add_uint(stream, "spf", 352); // frames per packet
+  wplist_dict_add_uint(stream, "spf", AIRPLAY_SAMPLES_PER_PACKET); // frames per packet
   wplist_dict_add_uint(stream, "sr", AIRPLAY_QUALITY_SAMPLE_RATE_DEFAULT); // sample rate
   wplist_dict_add_uint(stream, "type", AIRPLAY_RTP_PAYLOADTYPE); // RTP type, 0x60 = 96 real time, 103 buffered
   wplist_dict_add_bool(stream, "supportsDynamicStreamID", false);
@@ -2784,36 +2796,10 @@ payload_make_record(struct evrtsp_request *req, struct airplay_session *rs, void
   return 0;
 }
 
-// {'deviceID': '11:22:33:44:55:66',
-//  'eiv': b'=o\xa0\xc24\xcd\xee\xcb9\x99~l\x140\x08\x9c',
-//  'ekey': b'\x08\x90x\xa6\x0e\x87$C\x88l\xc1MS[Q\xaf',
-//  'et': 0,
-//  'groupContainsGroupLeader': False,
-//  'groupUUID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
-//  'isMultiSelectAirPlay': True,
-//  'macAddress': '11:22:33:44:55:68',
-//  'model': 'iPhone10,6',
-//  'name': 'iPXema',
-//  'osBuildVersion': '17B111',
-//  'osName': 'iPhone OS',
-//  'osVersion': '13.2.3',
-//  'senderSupportsRelay': True,
-//  'sessionUUID': '3195C737-1E6E-4487-BECB-4D287B7C7626',
-//  'sourceVersion': '409.16',
-//  'timingPeerInfo': {'Addresses': ['192.168.1.86', 'fe80::473:74c7:28a7:3bee'],
-//                     'ID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
-//                     'SupportsClockPortMatchingOverride': True},
-//  'timingPeerList': [{'Addresses': ['192.168.1.86', 'fe80::473:74c7:28a7:3bee'],
-//                      'ID': '67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB',
-//                      'SupportsClockPortMatchingOverride': True}],
-//  'timingProtocol': 'PTP'}
-
 static int
 payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *rs, void *arg)
 {
   plist_t root;
-//  plist_t timingpeerinfo;
-//  plist_t timingpeerlist;
   plist_t addresses;
   plist_t address;
   char device_id_colon[24];
@@ -2834,38 +2820,11 @@ payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *r
   addresses = plist_new_array();
   plist_array_append_item(addresses, address);
 
-/*  timingpeerinfo = plist_new_dict();
-  plist_dict_set_item(timingpeerinfo, "Addresses", addresses);
-  wplist_dict_add_string(timingpeerinfo, "ID", "67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB");
-  wplist_dict_add_bool(timingpeerinfo, "SupportsClockPortMatchingOverride", false);
-*/
-/*  timingpeerlist = plist_new_dict();
-  plist_dict_set_item(timingpeerlist, "Addresses", addresses);
-  wplist_dict_add_string(timingpeerlist, "ID", "67EAD1FA-7EAB-4810-82F7-A9132FD2D0BB");
-  wplist_dict_add_bool(timingpeerlist, "SupportsClockPortMatchingOverride", false);
-*/
   root = plist_new_dict();
   wplist_dict_add_string(root, "deviceID", device_id_colon);
-//  wplist_dict_add_data(root, "eiv", airplay_aes_iv, sizeof(airplay_aes_iv));
-//  wplist_dict_add_data(root, "ekey", airplay_aes_key, sizeof(airplay_aes_key));
-//  wplist_dict_add_uint(root, "et", 0); // No encryption?
-//  wplist_dict_add_bool(root, "groupContainsGroupLeader", true);
-//  wplist_dict_add_string(root, "groupUUID", "3195C737-1E6E-4487-BECB-4D287B7C1234");
-//  wplist_dict_add_bool(root, "internalBuild", false);
-//  wplist_dict_add_bool(root, "isMultiSelectAirPlay", true);
-//  wplist_dict_add_string(root, "macAddress", "00:0c:29:f6:4a:f9");
-//  wplist_dict_add_string(root, "model", "iPhone10,4");
-//  wplist_dict_add_string(root, "osBuildVersion", "18B92");
-//  wplist_dict_add_string(root, "osName", "iPhone OS");
-//  wplist_dict_add_string(root, "osVersion", "14.2");
-//  wplist_dict_add_bool(root, "senderSupportsRelay", true);
-  wplist_dict_add_string(root, "sessionUUID", "3195C737-1E6E-4487-BECB-4D287B7C7626");
-//  wplist_dict_add_string(root, "sourceVersion", "525.38.2");
-//  plist_dict_set_item(root, "timingPeerInfo", timingpeerinfo); // only for PTP timing?
-//  plist_dict_set_item(root, "timingPeerList", timingpeerlist); // only for PTP timing?
+  wplist_dict_add_string(root, "sessionUUID", rs->session_uuid);
   wplist_dict_add_uint(root, "timingPort", rs->timing_svc->port);
   wplist_dict_add_string(root, "timingProtocol", "NTP"); // If set to "None" then an ATV4 will not respond to stream SETUP request
-//  wplist_dict_add_string(root, "timingProtocol", "None");
 
   ret = wplist_to_bin(&data, &len, root);
   plist_free(root);
