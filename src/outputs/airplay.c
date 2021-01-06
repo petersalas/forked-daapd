@@ -902,55 +902,6 @@ request_headers_add(struct evrtsp_request *req, struct airplay_session *rs, enum
   return 0;
 }
 
-static int
-session_url_set(struct airplay_session *rs)
-{
-  char *address = NULL;
-  char *intf;
-  unsigned short port;
-  int family;
-  int ret;
-
-  // Determine local address, needed for session URL
-  evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
-  if (!address || (port == 0))
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not determine local address\n");
-      goto error;
-    }
-
-  intf = strchr(address, '%');
-  if (intf)
-    {
-      *intf = '\0';
-      intf++;
-    }
-
-  DPRINTF(E_DBG, L_AIRPLAY, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
-
-  // Session UUID, ID and session URL
-  uuid_make(rs->session_uuid);
-
-  gcry_randomize(&rs->session_id, sizeof(rs->session_id), GCRY_STRONG_RANDOM);
-
-  if (family == AF_INET)
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, rs->session_id);
-  else
-    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, rs->session_id);
-  if ((ret < 0) || (ret >= sizeof(rs->session_url)))
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Session URL length exceeds 127 characters\n");
-      goto error;
-    }
-
-  rs->local_address = address;
-  return 0;
-
- error:
-  free(address);
-  return -1;
-}
-
 static void
 metadata_rtptimes_get(uint32_t *start, uint32_t *display, uint32_t *pos, uint32_t *end, struct airplay_master_session *rms, struct output_metadata *metadata)
 {
@@ -1423,6 +1374,55 @@ session_connection_setup(struct airplay_session *rs, struct output_device *rd, i
   return 0;
 }
 
+static int
+session_ids_set(struct airplay_session *rs)
+{
+  char *address = NULL;
+  char *intf;
+  unsigned short port;
+  int family;
+  int ret;
+
+  // Determine local address, needed for session URL
+  evrtsp_connection_get_local_address(rs->ctrl, &address, &port, &family);
+  if (!address || (port == 0))
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not determine local address\n");
+      goto error;
+    }
+
+  intf = strchr(address, '%');
+  if (intf)
+    {
+      *intf = '\0';
+      intf++;
+    }
+
+  DPRINTF(E_DBG, L_AIRPLAY, "Local address: %s (LL: %s) port %d\n", address, (intf) ? intf : "no", port);
+
+  // Session UUID, ID and session URL
+  uuid_make(rs->session_uuid);
+
+  gcry_randomize(&rs->session_id, sizeof(rs->session_id), GCRY_STRONG_RANDOM);
+
+  if (family == AF_INET)
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://%s/%u", address, rs->session_id);
+  else
+    ret = snprintf(rs->session_url, sizeof(rs->session_url), "rtsp://[%s]/%u", address, rs->session_id);
+  if ((ret < 0) || (ret >= sizeof(rs->session_url)))
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Session URL length exceeds 127 characters\n");
+      goto error;
+    }
+
+  rs->local_address = address;
+  return 0;
+
+ error:
+  free(address);
+  return -1;
+}
+
 static struct airplay_session *
 session_make(struct output_device *rd, int callback_id)
 {
@@ -1468,6 +1468,13 @@ session_make(struct output_device *rd, int callback_id)
       ret = session_connection_setup(rs, rd, AF_INET);
       if (ret < 0)
 	goto error;
+    }
+
+  ret = session_ids_set(rs);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not make session url or id for device '%s'\n", rs->devname);
+      goto error;
     }
 
   rs->master_session = master_session_make(&rd->quality);
@@ -2806,13 +2813,6 @@ payload_make_setup_session(struct evrtsp_request *req, struct airplay_session *r
   uint8_t *data;
   size_t len;
   int ret;
-
-  ret = session_url_set(rs);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not make session url for device '%s'\n", rs->devname);
-      return -1;
-    }
 
   device_id_colon_make(device_id_colon, sizeof(device_id_colon), airplay_device_id);
 
