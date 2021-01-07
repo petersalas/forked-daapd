@@ -73,8 +73,8 @@
 #define AIRPLAY_USE_STREAMID                 0
 #define AIRPLAY_USE_PAIRING_TRANSIENT        1
 
-// Full traffic dumps and some other stuff
-#define AIRPLAY_EXTENDED_LOGGING             1
+// Full traffic dumps in the log
+#define AIRPLAY_DUMP_TRAFFIC                 1
 
 
 #define ALAC_HEADER_LEN                      3
@@ -985,7 +985,7 @@ rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
 
   if (encrypt)
     {
-#if AIRPLAY_EXTENDED_LOGGING
+#if AIRPLAY_DUMP_TRAFFIC
       if (in_len < 4096)
 	DHEXDUMP(E_DBG, L_AIRPLAY, in, in_len, "Encrypting outgoing request\n");
       else
@@ -1002,7 +1002,7 @@ rtsp_cipher(struct evbuffer *evbuf, void *arg, int encrypt)
       if (ret < 0)
 	goto error;
 
-#if AIRPLAY_EXTENDED_LOGGING
+#if AIRPLAY_DUMP_TRAFFIC
       if (out_len < 4096)
 	DHEXDUMP(E_DBG, L_AIRPLAY, out, out_len, "Decrypted incoming response\n");
       else
@@ -3909,18 +3909,14 @@ features_parse(struct keyval *features_kv, const char *fs1, const char *fs2, con
 	{
 	  if (i == features_map[j].bit)
 	    {
-#if AIRPLAY_EXTENDED_LOGGING
-	      DPRINTF(E_DBG, L_AIRPLAY, "Speaker '%s' announced feature %d: '%s'\n", name, i, features_map[j].name);
-#endif
+	      DPRINTF(E_SPAM, L_AIRPLAY, "Speaker '%s' announced feature %d: '%s'\n", name, i, features_map[j].name);
               keyval_add(features_kv, features_map[j].name, "1");
 	      break;
 	    }
 	}
 
-#if AIRPLAY_EXTENDED_LOGGING
       if (j == ARRAY_SIZE(features_map))
-	DPRINTF(E_DBG, L_AIRPLAY, "Speaker '%s' announced feature %d: 'Unknown'\n", name, i);
-#endif
+	DPRINTF(E_SPAM, L_AIRPLAY, "Speaker '%s' announced feature %d: 'Unknown'\n", name, i);
     }
 
   return 0;
