@@ -66,6 +66,8 @@
  * latency needs different handling
  * support ipv6, e.g. in SETPEERS
  * ffmpeg alac encoding
+ * tlv fails to parse 07 01 02 06 01 04
+ *
  */
 
 // Airplay 2 has a gazallion parameters, many of them unknown to us. With the
@@ -137,11 +139,10 @@ enum airplay_state {
   // Device is stopped (no session)
   AIRPLAY_STATE_STOPPED   = 0,
   // Session startup
-  AIRPLAY_STATE_STARTUP   = AIRPLAY_STATE_F_STARTUP | 0x01,
-  AIRPLAY_STATE_OPTIONS   = AIRPLAY_STATE_F_STARTUP | 0x02,
-  AIRPLAY_STATE_ANNOUNCE  = AIRPLAY_STATE_F_STARTUP | 0x03,
-  AIRPLAY_STATE_SETUP     = AIRPLAY_STATE_F_STARTUP | 0x04,
-  AIRPLAY_STATE_RECORD    = AIRPLAY_STATE_F_STARTUP | 0x05,
+  AIRPLAY_STATE_INFO      = AIRPLAY_STATE_F_STARTUP | 0x01,
+  AIRPLAY_STATE_ENCRYPTED = AIRPLAY_STATE_F_STARTUP | 0x02,
+  AIRPLAY_STATE_SETUP     = AIRPLAY_STATE_F_STARTUP | 0x03,
+  AIRPLAY_STATE_RECORD    = AIRPLAY_STATE_F_STARTUP | 0x04,
   // Session established
   // - streaming ready (RECORD sent and acked, connection established)
   // - commands (SET_PARAMETER) are possible
@@ -152,16 +153,15 @@ enum airplay_state {
   AIRPLAY_STATE_TEARDOWN  = AIRPLAY_STATE_F_CONNECTED | 0x03,
   // Session is failed, couldn't startup or error occurred
   AIRPLAY_STATE_FAILED    = AIRPLAY_STATE_F_FAILED | 0x01,
-  // Password issue: unknown password or bad password, or pending PIN from user
-  AIRPLAY_STATE_PASSWORD  = AIRPLAY_STATE_F_FAILED | 0x02,
+  // Pending PIN or password
+  AIRPLAY_STATE_AUTH      = AIRPLAY_STATE_F_FAILED | 0x02,
 };
 
 enum airplay_seq_type
 {
   AIRPLAY_SEQ_ABORT = -1,
   AIRPLAY_SEQ_START,
-  AIRPLAY_SEQ_START_RERUN,
-  AIRPLAY_SEQ_START_AP2,
+  AIRPLAY_SEQ_START_PLAYBACK,
   AIRPLAY_SEQ_PROBE,
   AIRPLAY_SEQ_FLUSH,
   AIRPLAY_SEQ_STOP,
@@ -176,6 +176,26 @@ enum airplay_seq_type
   AIRPLAY_SEQ_PAIR_TRANSIENT,
   AIRPLAY_SEQ_FEEDBACK,
   AIRPLAY_SEQ_CONTINUE, // Must be last element
+};
+
+// From https://openairplay.github.io/airplay-spec/status_flags.html
+enum airplay_status_flags
+{
+  AIRPLAY_FLAG_PROBLEM_DETECTED               = (1 << 0),
+  AIRPLAY_FLAG_NOT_CONFIGURED                 = (1 << 1),
+  AIRPLAY_FLAG_AUDIO_CABLE_ATTACHED           = (1 << 2),
+  AIRPLAY_FLAG_PIN_REQUIRED                   = (1 << 3),
+  AIRPLAY_FLAG_SUPPORTS_FROM_CLOUD            = (1 << 6),
+  AIRPLAY_FLAG_PASSWORD_REQUIRED              = (1 << 7),
+  AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED      = (1 << 9),
+  AIRPLAY_FLAG_SETUP_HK_ACCESS_CTRL           = (1 << 10),
+  AIRPLAY_FLAG_SUPPORTS_RELAY                 = (1 << 11),
+  AIRPLAY_FLAG_SILENT_PRIMARY                 = (1 << 12),
+  AIRPLAY_FLAG_TIGHT_SYNC_IS_GRP_LEADER       = (1 << 13),
+  AIRPLAY_FLAG_TIGHT_SYNC_BUDDY_NOT_REACHABLE = (1 << 14),
+  AIRPLAY_FLAG_IS_APPLE_MUSIC_SUBSCRIBER      = (1 << 15),
+  AIRPLAY_FLAG_CLOUD_LIBRARY_ON               = (1 << 16),
+  AIRPLAY_FLAG_RECEIVER_IS_BUSY               = (1 << 17),
 };
 
 // Info about the device, which is not required by the player, only internally
@@ -222,9 +242,9 @@ struct airplay_session
 
   enum airplay_seq_type next_seq;
 
+  uint64_t statusflags;
   uint16_t wanted_metadata;
   bool req_has_auth;
-  bool supports_post;
   bool supports_auth_setup;
 
   struct event *deferredev;
@@ -876,7 +896,7 @@ request_headers_add(struct evrtsp_request *req, struct airplay_session *rs, enum
       DPRINTF(E_LOG, L_AIRPLAY, "Could not add Authorization header\n");
 
       if (ret == -2)
-	rs->state = AIRPLAY_STATE_PASSWORD;
+	rs->state = AIRPLAY_STATE_AUTH;
 
       return -1;
     }
@@ -1036,7 +1056,7 @@ session_status(struct airplay_session *rs)
 
   switch (rs->state)
     {
-      case AIRPLAY_STATE_PASSWORD:
+      case AIRPLAY_STATE_AUTH:
 	state = OUTPUT_STATE_PASSWORD;
 	break;
       case AIRPLAY_STATE_FAILED:
@@ -1045,7 +1065,7 @@ session_status(struct airplay_session *rs)
       case AIRPLAY_STATE_STOPPED:
 	state = OUTPUT_STATE_STOPPED;
 	break;
-      case AIRPLAY_STATE_STARTUP ... AIRPLAY_STATE_RECORD:
+      case AIRPLAY_STATE_INFO ... AIRPLAY_STATE_RECORD:
 	state = OUTPUT_STATE_STARTUP;
 	break;
       case AIRPLAY_STATE_CONNECTED:
@@ -1222,7 +1242,7 @@ static void
 session_failure(struct airplay_session *rs)
 {
   /* Session failed, let our user know */
-  if (rs->state != AIRPLAY_STATE_PASSWORD)
+  if (rs->state != AIRPLAY_STATE_AUTH)
     rs->state = AIRPLAY_STATE_FAILED;
 
   session_status(rs);
@@ -1244,7 +1264,7 @@ deferred_session_failure(struct airplay_session *rs)
 {
   struct timeval tv;
 
-  if (rs->state != AIRPLAY_STATE_PASSWORD)
+  if (rs->state != AIRPLAY_STATE_AUTH)
     rs->state = AIRPLAY_STATE_FAILED;
 
   evutil_timerclear(&tv);
@@ -1455,12 +1475,6 @@ session_make(struct output_device *rd, int callback_id)
   rs->wanted_metadata = re->wanted_metadata;
 
   rs->next_seq = AIRPLAY_SEQ_CONTINUE;
-  rs->pair_type = PAIR_HOMEKIT_NORMAL;
-#if AIRPLAY_USE_PAIRING_TRANSIENT
-  // requires_auth will be set if the device returned a 470 RTSP_CONNECTION_AUTH_REQUIRED
-  if (!rd->requires_auth && re->supports_pairing_transient)
-    rs->pair_type = PAIR_HOMEKIT_TRANSIENT;
-#endif
 
   ret = session_connection_setup(rs, rd, AF_INET6);
   if (ret < 0)
@@ -1468,13 +1482,6 @@ session_make(struct output_device *rd, int callback_id)
       ret = session_connection_setup(rs, rd, AF_INET);
       if (ret < 0)
 	goto error;
-    }
-
-  ret = session_ids_set(rs);
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not make session url or id for device '%s'\n", rs->devname);
-      goto error;
     }
 
   rs->master_session = master_session_make(&rd->quality);
@@ -2952,7 +2959,7 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs,
       return -1;
     }
 
-  rs->state = AIRPLAY_STATE_PASSWORD;
+  rs->state = AIRPLAY_STATE_AUTH;
 
   return payload_make_pair_generic(1, req, rs);
 }
@@ -3111,7 +3118,7 @@ probe_failure(struct airplay_session *rs)
 static enum airplay_seq_type
 response_handler_pin_start(struct evrtsp_request *req, struct airplay_session *rs)
 {
-  rs->state = AIRPLAY_STATE_PASSWORD;
+  rs->state = AIRPLAY_STATE_AUTH;
 
   return AIRPLAY_SEQ_CONTINUE; // TODO before we reported failure since device is locked
 }
@@ -3278,83 +3285,110 @@ response_handler_teardown(struct evrtsp_request *req, struct airplay_session *rs
 static enum airplay_seq_type
 response_handler_teardown_failure(struct evrtsp_request *req, struct airplay_session *rs)
 {
-  if (rs->state != AIRPLAY_STATE_PASSWORD)
+  if (rs->state != AIRPLAY_STATE_AUTH)
     rs->state = AIRPLAY_STATE_FAILED;
   return AIRPLAY_SEQ_CONTINUE;
 }
 
 static enum airplay_seq_type
-response_handler_options_generic(struct evrtsp_request *req, struct airplay_session *rs)
+response_handler_info_generic(struct evrtsp_request *req, struct airplay_session *rs)
 {
   struct output_device *device;
-  const char *param;
+  plist_t response;
+  plist_t item;
   int ret;
 
-  if ((req->response_code != RTSP_OK) && (req->response_code != RTSP_UNAUTHORIZED) && (req->response_code != RTSP_FORBIDDEN))
+  device = outputs_device_get(rs->device_id);
+  if (!device)
+    return AIRPLAY_SEQ_ABORT;
+
+  ret = session_ids_set(rs);
+  if (ret < 0)
     {
-      DPRINTF(E_LOG, L_AIRPLAY, "OPTIONS request failed '%s' (%s): %d %s\n", rs->devname, rs->address, req->response_code, req->response_code_line);
-      goto error;
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not make session url or id for device '%s'\n", rs->devname);
+      return AIRPLAY_SEQ_ABORT;
     }
 
-  if (req->response_code == RTSP_UNAUTHORIZED)
+  ret = wplist_from_evbuf(&response, req->input_buffer);
+  if (ret < 0)
     {
-      if (rs->req_has_auth)
-	{
-	  DPRINTF(E_LOG, L_AIRPLAY, "Bad password for device '%s' (%s)\n", rs->devname, rs->address);
-	  rs->state = AIRPLAY_STATE_PASSWORD;
-	  goto error;
-	}
-
-      ret = response_header_auth_parse(rs, req);
-      if (ret < 0)
-	{
-	  goto error;
-	}
-
-      return AIRPLAY_SEQ_START_RERUN;
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not parse plist from '%s'\n", rs->devname);
+      return AIRPLAY_SEQ_ABORT;
     }
 
-  if (req->response_code == RTSP_FORBIDDEN)
-    {
-      device = outputs_device_get(rs->device_id);
-      if (!device)
-	goto error;
+  item = plist_dict_get_item(response, "statusFlags");
+  if (item)
+    plist_get_uint_val(item, &rs->statusflags);
 
+  plist_free(response);
+
+  DPRINTF(E_INFO, L_AIRPLAY, "Status flags from '%s' was %" PRIu64 ": cable attached %d, one time pairing %d, password %d, PIN %d\n",
+    rs->devname, rs->statusflags, (bool)(rs->statusflags & AIRPLAY_FLAG_AUDIO_CABLE_ATTACHED), (bool)(rs->statusflags & AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED),
+    (bool)(rs->statusflags & AIRPLAY_FLAG_PASSWORD_REQUIRED), (bool)(rs->statusflags & AIRPLAY_FLAG_PIN_REQUIRED));
+
+  // Evaluate what next sequence based on response
+  if (rs->statusflags & AIRPLAY_FLAG_ONE_TIME_PAIRING_REQUIRED)
+    {
+      rs->pair_type = PAIR_HOMEKIT_NORMAL;
+
+      if (!device->auth_key)
+	{
+	  device->requires_auth = 1;
+          rs->state = AIRPLAY_STATE_AUTH;
+	  return AIRPLAY_SEQ_PIN_START;
+	}
+
+      rs->state = AIRPLAY_STATE_INFO;
+      return AIRPLAY_SEQ_PAIR_VERIFY;
+    }
+  else if (rs->statusflags & AIRPLAY_FLAG_PIN_REQUIRED)
+    {
+      free(device->auth_key);
+      device->auth_key = NULL;
       device->requires_auth = 1;
 
+      rs->pair_type = PAIR_HOMEKIT_NORMAL;
+      rs->state = AIRPLAY_STATE_AUTH;
       return AIRPLAY_SEQ_PIN_START;
     }
+  else if (rs->statusflags & AIRPLAY_FLAG_PASSWORD_REQUIRED)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "'%s' requires password authentication, but that is currently unsupported for AirPlay 2\n", rs->devname);
+      rs->state = AIRPLAY_STATE_AUTH;
+      return AIRPLAY_SEQ_ABORT;
+    }
 
-  param = evrtsp_find_header(req->input_headers, "Public");
-  if (param)
-    rs->supports_post = (strstr(param, "POST") != NULL);
-  else
-    DPRINTF(E_DBG, L_AIRPLAY, "Could not find 'Public' header in OPTIONS reply from '%s' (%s)\n", rs->devname, rs->address);
-
-  rs->state = AIRPLAY_STATE_OPTIONS;
-
-  return AIRPLAY_SEQ_CONTINUE;
-
- error:
-  return AIRPLAY_SEQ_ABORT;
+  rs->pair_type = PAIR_HOMEKIT_TRANSIENT;
+  rs->state = AIRPLAY_STATE_INFO;
+  return AIRPLAY_SEQ_PAIR_TRANSIENT;
 }
 
 static enum airplay_seq_type
-response_handler_options_probe(struct evrtsp_request *req, struct airplay_session *rs)
-{
-  return response_handler_options_generic(req, rs);
-}
-
-static enum airplay_seq_type
-response_handler_options_start(struct evrtsp_request *req, struct airplay_session *rs)
+response_handler_info_probe(struct evrtsp_request *req, struct airplay_session *rs)
 {
   enum airplay_seq_type seq_type;
 
-  seq_type = response_handler_options_generic(req, rs);
-  if (seq_type != AIRPLAY_SEQ_CONTINUE)
+  seq_type = response_handler_info_generic(req, rs);
+  if (seq_type == AIRPLAY_SEQ_ABORT || seq_type == AIRPLAY_SEQ_PIN_START)
     return seq_type;
 
-  return AIRPLAY_SEQ_START_AP2;
+  // When probing we don't want to continue with PAIR_VERIFY or PAIR_TRANSIENT
+  return AIRPLAY_SEQ_CONTINUE;
+}
+
+static enum airplay_seq_type
+response_handler_info_start(struct evrtsp_request *req, struct airplay_session *rs)
+{
+  enum airplay_seq_type seq_type;
+
+  seq_type = response_handler_info_generic(req, rs);
+  if (seq_type == AIRPLAY_SEQ_ABORT || seq_type == AIRPLAY_SEQ_PIN_START)
+    return seq_type;
+
+  // Pair and then run SEQ_START_PLAYBACK which sets up the playback
+  rs->next_seq = AIRPLAY_SEQ_START_PLAYBACK;
+
+  return seq_type;
 }
 
 static enum airplay_seq_type
@@ -3474,7 +3508,7 @@ response_handler_pair_setup2(struct evrtsp_request *req, struct airplay_session 
 
   DPRINTF(E_INFO, L_AIRPLAY, "Transient setup of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
 
-  rs->state = AIRPLAY_STATE_STARTUP;
+  rs->state = AIRPLAY_STATE_ENCRYPTED;
 
   return AIRPLAY_SEQ_CONTINUE;
 
@@ -3514,7 +3548,7 @@ response_handler_pair_setup3(struct evrtsp_request *req, struct airplay_session 
   // A blocking db call... :-~
   db_speaker_save(device);
 
-  // No longer AIRPLAY_STATE_PASSWORD
+  // No longer AIRPLAY_STATE_AUTH
   rs->state = AIRPLAY_STATE_STOPPED;
 
   return AIRPLAY_SEQ_CONTINUE;
@@ -3529,7 +3563,7 @@ response_handler_pair_verify1(struct evrtsp_request *req, struct airplay_session
   seq_type = response_handler_pair_generic(4, req, rs);
   if (seq_type != AIRPLAY_SEQ_CONTINUE)
     {
-      rs->state = AIRPLAY_STATE_PASSWORD;
+      rs->state = AIRPLAY_STATE_AUTH;
 
       device = outputs_device_get(rs->device_id);
       if (!device)
@@ -3591,7 +3625,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
 
   DPRINTF(E_INFO, L_AIRPLAY, "Pairing  of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
 
-  rs->state = AIRPLAY_STATE_STARTUP;
+  rs->state = AIRPLAY_STATE_ENCRYPTED;
 
   return AIRPLAY_SEQ_CONTINUE;
 
@@ -3604,7 +3638,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
   free(device->auth_key);
   device->auth_key = NULL;
 
-  rs->state = AIRPLAY_STATE_PASSWORD;
+  rs->state = AIRPLAY_STATE_AUTH;
 
   return AIRPLAY_SEQ_ABORT;
 }
@@ -3642,8 +3676,7 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
 static struct airplay_seq_definition airplay_seq_definition[] =
 {
   { AIRPLAY_SEQ_START, NULL, start_retry },
-  { AIRPLAY_SEQ_START_RERUN, NULL, start_retry },
-  { AIRPLAY_SEQ_START_AP2, session_connected, start_failure },
+  { AIRPLAY_SEQ_START_PLAYBACK, session_connected, start_failure },
   { AIRPLAY_SEQ_PROBE, session_success, probe_failure },
   { AIRPLAY_SEQ_FLUSH, session_status, session_failure },
   { AIRPLAY_SEQ_STOP, session_success, session_failure },
@@ -3664,22 +3697,18 @@ static struct airplay_seq_definition airplay_seq_definition[] =
 static struct airplay_seq_request airplay_seq_request[][7] = 
 {
   {
-    // response_handler_options() will determine appropriate sequence to continue with based on device response
-    { AIRPLAY_SEQ_START, "OPTIONS", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_start, NULL, "*", true },
+    { AIRPLAY_SEQ_START, "GET /info", EVRTSP_REQ_GET, NULL, response_handler_info_start, NULL, "/info", false },
   },
   {
-    { AIRPLAY_SEQ_START_RERUN, "OPTIONS (re-run)", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_start, NULL, "*", false },
+//    { AIRPLAY_SEQ_START_PLAYBACK, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
+    { AIRPLAY_SEQ_START_PLAYBACK, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, false },
+    { AIRPLAY_SEQ_START_PLAYBACK, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
+    { AIRPLAY_SEQ_START_PLAYBACK, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
+    { AIRPLAY_SEQ_START_PLAYBACK, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
+    { AIRPLAY_SEQ_START_PLAYBACK, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
   },
   {
-//    { AIRPLAY_SEQ_START_AP2, "auth-setup", EVRTSP_REQ_POST, payload_make_auth_setup, NULL, "application/octet-stream", "/auth-setup", true },
-    { AIRPLAY_SEQ_START_AP2, "SETUP (session)", EVRTSP_REQ_SETUP, payload_make_setup_session, response_handler_setup_session, "application/x-apple-binary-plist", NULL, false },
-    { AIRPLAY_SEQ_START_AP2, "SETPEERS", EVRTSP_REQ_SETPEERS, payload_make_setpeers, NULL, "/peer-list-changed", NULL, false },
-    { AIRPLAY_SEQ_START_AP2, "SETUP (stream)", EVRTSP_REQ_SETUP, payload_make_setup_stream, response_handler_setup_stream, "application/x-apple-binary-plist", NULL, false },
-    { AIRPLAY_SEQ_START_AP2, "SET_PARAMETER (volume)", EVRTSP_REQ_SET_PARAMETER, payload_make_set_volume, response_handler_volume_start, "text/parameters", NULL, true },
-    { AIRPLAY_SEQ_START_AP2, "RECORD", EVRTSP_REQ_RECORD, payload_make_record, response_handler_record, NULL, NULL, false },
-  },
-  {
-    { AIRPLAY_SEQ_PROBE, "OPTIONS (probe)", EVRTSP_REQ_OPTIONS, NULL, response_handler_options_probe, NULL, "*", true },
+    { AIRPLAY_SEQ_PROBE, "GET /info (probe)", EVRTSP_REQ_GET, NULL, response_handler_info_probe, NULL, "/info", false },
   },
   {
     { AIRPLAY_SEQ_FLUSH, "FLUSH", EVRTSP_REQ_FLUSH, payload_make_flush, response_handler_flush, NULL, NULL, false },
@@ -4125,7 +4154,7 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
 /*                                Thread: player                              */
 
 static int
-airplay_device_start_generic(struct output_device *device, int callback_id, bool only_probe)
+airplay_device_probe(struct output_device *device, int callback_id)
 {
   struct airplay_session *rs;
 
@@ -4133,32 +4162,23 @@ airplay_device_start_generic(struct output_device *device, int callback_id, bool
   if (!rs)
     return -1;
 
-  // After pairing/device verification, send an OPTIONS request.
-  if (only_probe)
-    rs->next_seq = AIRPLAY_SEQ_PROBE;
-  else
-    rs->next_seq = AIRPLAY_SEQ_START;
-
-  if (device->auth_key)
-    sequence_start(AIRPLAY_SEQ_PAIR_VERIFY, rs, NULL, "device_start");
-  else if (rs->pair_type == PAIR_HOMEKIT_TRANSIENT)
-    sequence_start(AIRPLAY_SEQ_PAIR_TRANSIENT, rs, NULL, "device_start");
-  else
-    sequence_start(AIRPLAY_SEQ_PIN_START, rs, NULL, "device_start");
+  sequence_start(AIRPLAY_SEQ_PROBE, rs, NULL, "device_probe");
 
   return 1;
 }
 
 static int
-airplay_device_probe(struct output_device *device, int callback_id)
-{
-  return airplay_device_start_generic(device, callback_id, 1);
-}
-
-static int
 airplay_device_start(struct output_device *device, int callback_id)
 {
-  return airplay_device_start_generic(device, callback_id, 0);
+  struct airplay_session *rs;
+
+  rs = session_make(device, callback_id);
+  if (!rs)
+    return -1;
+
+  sequence_start(AIRPLAY_SEQ_START, rs, NULL, "device_start");
+
+  return 1;
 }
 
 static int
