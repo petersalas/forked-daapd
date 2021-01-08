@@ -62,7 +62,6 @@
 /* List of TODO's for AirPlay 2
  *
  * inplace encryption
- * keep chacha encryptor open
  * latency needs different handling
  * support ipv6, e.g. in SETPEERS
  * ffmpeg alac encoding
@@ -279,6 +278,7 @@ struct airplay_session
   struct pair_setup_context *pair_setup_ctx;
 
   uint8_t shared_secret[32];
+  gcry_cipher_hd_t packet_cipher_hd;
 
   int server_fd;
 
@@ -611,35 +611,49 @@ device_id_colon_make(char *id_str, int size, uint64_t id)
 
 /* ------------------------------- Crypto ----------------------------------- */
 
-static int
-encrypt_chacha(uint8_t *cipher, uint8_t *plain, size_t plain_len, const uint8_t *key, size_t key_len, const void *ad, size_t ad_len, uint8_t *tag, size_t tag_len, uint8_t *nonce, size_t nonce_len)
+static void
+chacha_close(gcry_cipher_hd_t hd)
+{
+  if (!hd)
+    return;
+
+  gcry_cipher_close(hd);
+}
+
+static gcry_cipher_hd_t
+chacha_open(const uint8_t *key, size_t key_len)
 {
   gcry_cipher_hd_t hd;
 
   if (gcry_cipher_open(&hd, GCRY_CIPHER_CHACHA20, GCRY_CIPHER_MODE_POLY1305, 0) != GPG_ERR_NO_ERROR)
-    return -1;
+    goto error;
 
   if (gcry_cipher_setkey(hd, key, key_len) != GPG_ERR_NO_ERROR)
     goto error;
 
-  if (gcry_cipher_setiv(hd, nonce, nonce_len) != GPG_ERR_NO_ERROR)
-    goto error;
-
-  if (gcry_cipher_authenticate(hd, ad, ad_len) != GPG_ERR_NO_ERROR)
-    goto error;
-
-  if (gcry_cipher_encrypt(hd, cipher, plain_len, plain, plain_len) != GPG_ERR_NO_ERROR)
-    goto error;
-
-  if (gcry_cipher_gettag(hd, tag, tag_len) != GPG_ERR_NO_ERROR)
-    goto error;
-
-  gcry_cipher_close(hd);
-  return 0;
+  return hd;
 
  error:
-  gcry_cipher_close(hd);
-  return -1;
+  chacha_close(hd);
+  return NULL;
+}
+
+static int
+chacha_encrypt(uint8_t *cipher, uint8_t *plain, size_t plain_len, const void *ad, size_t ad_len, uint8_t *tag, size_t tag_len, uint8_t *nonce, size_t nonce_len, gcry_cipher_hd_t hd)
+{
+  if (gcry_cipher_setiv(hd, nonce, nonce_len) != GPG_ERR_NO_ERROR)
+    return -1;
+
+  if (gcry_cipher_authenticate(hd, ad, ad_len) != GPG_ERR_NO_ERROR)
+    return -1;
+
+  if (gcry_cipher_encrypt(hd, cipher, plain_len, plain, plain_len) != GPG_ERR_NO_ERROR)
+    return -1;
+
+  if (gcry_cipher_gettag(hd, tag, tag_len) != GPG_ERR_NO_ERROR)
+    return -1;
+
+  return 0;
 }
 
 
@@ -769,7 +783,7 @@ request_header_auth_add(struct evrtsp_request *req, struct airplay_session *rs, 
 
   return 0;
 }
-
+/*
 static int
 response_header_auth_parse(struct airplay_session *rs, struct evrtsp_request *req)
 {
@@ -866,7 +880,7 @@ response_header_auth_parse(struct airplay_session *rs, struct evrtsp_request *re
 
   return 0;
 }
-
+*/
 static int
 request_headers_add(struct evrtsp_request *req, struct airplay_session *rs, enum evrtsp_cmd_type req_method)
 {
@@ -1199,6 +1213,8 @@ session_free(struct airplay_session *rs)
   if (rs->events_fd >= 0)
     close(rs->events_fd);
 
+  chacha_close(rs->packet_cipher_hd);
+
   pair_setup_free(rs->pair_setup_ctx);
   pair_verify_free(rs->pair_verify_ctx);
   pair_cipher_free(rs->control_cipher_ctx);
@@ -1391,6 +1407,61 @@ session_connection_setup(struct airplay_session *rs, struct output_device *rd, i
   rs->family = family;
 
   return 0;
+}
+
+static int
+session_cipher_setup(struct airplay_session *rs, const uint8_t *key, size_t key_len)
+{
+  struct pair_cipher_context *control_cipher_ctx = NULL;
+  struct pair_cipher_context *events_cipher_ctx = NULL;
+  gcry_cipher_hd_t packet_cipher_hd = NULL;
+
+  if (key_len < sizeof(rs->shared_secret)) // For transient pairing the key_len will be 64 bytes, and rs->shared_secret is 32 bytes
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Ciphering setup error: Unexpected key length (%zu)\n", key_len);
+      goto error;
+    }
+
+  control_cipher_ctx = pair_cipher_new(rs->pair_type, 0, key, key_len);
+  if (!control_cipher_ctx)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not create control ciphering context\n");
+      goto error;
+    }
+
+  events_cipher_ctx = pair_cipher_new(rs->pair_type, 1, key, key_len);
+  if (!events_cipher_ctx)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not create events ciphering context\n");
+      goto error;
+    }
+
+  // Copy the first 32 bytes, will be used for encrypting audio payload
+  memcpy(rs->shared_secret, key, sizeof(rs->shared_secret));
+
+  packet_cipher_hd = chacha_open(rs->shared_secret, sizeof(rs->shared_secret));
+  if (!packet_cipher_hd)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY, "Could not create packet ciphering handle\n");
+      goto error;
+    }
+
+  DPRINTF(E_INFO, L_AIRPLAY, "Ciphering setup of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
+
+  rs->state = AIRPLAY_STATE_ENCRYPTED;
+  rs->control_cipher_ctx = control_cipher_ctx;
+  rs->events_cipher_ctx = events_cipher_ctx;
+  rs->packet_cipher_hd = packet_cipher_hd;
+
+  evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
+
+  return 0;
+
+ error:
+  pair_cipher_free(control_cipher_ctx);
+  pair_cipher_free(events_cipher_ctx);
+  chacha_close(packet_cipher_hd);
+  return -1;
 }
 
 static int
@@ -1773,7 +1844,7 @@ packet_encrypt(uint8_t **out, size_t *out_len, struct rtp_packet *pkt, struct ai
   write_ptr = *out + pkt->header_len;
 
   // Timestamp and SSRC are used as AAD = pkt->header + 4, len 8
-  ret = encrypt_chacha(write_ptr, pkt->payload, pkt->payload_len, rs->shared_secret, sizeof(rs->shared_secret), pkt->header + 4, 8, authtag, sizeof(authtag), nonce, sizeof(nonce));
+  ret = chacha_encrypt(write_ptr, pkt->payload, pkt->payload_len, pkt->header + 4, 8, authtag, sizeof(authtag), nonce, sizeof(nonce), rs->packet_cipher_hd);
   if (ret < 0)
     {
       free(*out);
@@ -3486,28 +3557,12 @@ response_handler_pair_setup2(struct evrtsp_request *req, struct airplay_session 
       goto error;
     }
 
-  // Copy the first 32 bytes while be used later for encrypting audio payload
-  memcpy(rs->shared_secret, shared_secret, sizeof(rs->shared_secret));
-
-  rs->control_cipher_ctx = pair_cipher_new(rs->pair_type, 0, shared_secret, shared_secret_len);
-  if (!rs->control_cipher_ctx)
+  ret = session_cipher_setup(rs, shared_secret, shared_secret_len);
+  if (ret < 0)
     {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not create control ciphering context\n");
+      DPRINTF(E_LOG, L_AIRPLAY, "Pair transient error setting up encryption for '%s'\n", rs->devname);
       goto error;
     }
-
-  rs->events_cipher_ctx = pair_cipher_new(rs->pair_type, 1, shared_secret, shared_secret_len);
-  if (!rs->events_cipher_ctx)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not create events ciphering context\n");
-      goto error;
-    }
-
-  evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
-
-  DPRINTF(E_INFO, L_AIRPLAY, "Transient setup of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
-
-  rs->state = AIRPLAY_STATE_ENCRYPTED;
 
   return AIRPLAY_SEQ_CONTINUE;
 
@@ -3604,27 +3659,12 @@ response_handler_pair_verify2(struct evrtsp_request *req, struct airplay_session
       goto error;
     }
 
-  memcpy(rs->shared_secret, shared_secret, shared_secret_len);
-
-  rs->control_cipher_ctx = pair_cipher_new(rs->pair_type, 0, rs->shared_secret, sizeof(rs->shared_secret));
-  if (!rs->control_cipher_ctx)
+  ret = session_cipher_setup(rs, shared_secret, shared_secret_len);
+  if (ret < 0)
     {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not create control ciphering context\n");
+      DPRINTF(E_LOG, L_AIRPLAY, "Pair verify error setting up encryption for '%s'\n", rs->devname);
       goto error;
     }
-
-  rs->events_cipher_ctx = pair_cipher_new(rs->pair_type, 1, rs->shared_secret, sizeof(rs->shared_secret));
-  if (!rs->events_cipher_ctx)
-    {
-      DPRINTF(E_LOG, L_AIRPLAY, "Could not create events ciphering context\n");
-      goto error;
-    }
-
-  evrtsp_connection_set_ciphercb(rs->ctrl, rtsp_cipher, rs);
-
-  DPRINTF(E_INFO, L_AIRPLAY, "Pairing  of '%s' completed succesfully, now using encrypted mode\n", rs->devname);
-
-  rs->state = AIRPLAY_STATE_ENCRYPTED;
 
   return AIRPLAY_SEQ_CONTINUE;
 
