@@ -66,7 +66,6 @@
  * latency needs different handling
  * support ipv6, e.g. in SETPEERS
  * ffmpeg alac encoding
- * tlv fails to parse 07 01 02 06 01 04
  *
  */
 
