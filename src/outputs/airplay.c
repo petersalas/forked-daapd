@@ -2950,7 +2950,7 @@ payload_make_pair_setup1(struct evrtsp_request *req, struct airplay_session *rs,
   if (pin)
     rs->pair_type = PAIR_HOMEKIT_NORMAL;
 
-  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", airplay_device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%016" PRIX64, airplay_device_id);
 
   rs->pair_setup_ctx = pair_setup_new(rs->pair_type, pin, device_id_hex);
   if (!rs->pair_setup_ctx)
@@ -2986,7 +2986,7 @@ payload_make_pair_verify1(struct evrtsp_request *req, struct airplay_session *rs
   if (!device)
     return -1;
 
-  snprintf(device_id_hex, sizeof(device_id_hex), "%" PRIu64 "", airplay_device_id);
+  snprintf(device_id_hex, sizeof(device_id_hex), "%016" PRIX64, airplay_device_id);
 
   rs->pair_verify_ctx = pair_verify_new(rs->pair_type, device->auth_key, device_id_hex);
   if (!rs->pair_verify_ctx)
