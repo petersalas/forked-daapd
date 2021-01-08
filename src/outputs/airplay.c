@@ -2892,7 +2892,7 @@ static int
 payload_make_pair_generic(int step, struct evrtsp_request *req, struct airplay_session *rs)
 {
   uint8_t *body;
-  uint32_t len;
+  size_t len;
   const char *errmsg;
 
   switch (step)

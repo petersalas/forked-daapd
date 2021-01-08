@@ -4035,7 +4035,7 @@ raop_pair_request_send(int step, struct raop_session *rs, void (*cb)(struct evrt
 {
   struct evrtsp_request *req;
   uint8_t *body;
-  uint32_t len;
+  size_t len;
   const char *errmsg;
   const char *url;
   const char *ctype;
