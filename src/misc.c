@@ -199,7 +199,7 @@ net_connect(const char *addr, unsigned short port, int type, const char *log_ser
   ret = getaddrinfo(addr, strport, &hints, &servinfo);
   if (ret < 0)
     {
-      gai_strerror(ret);
+      DPRINTF(E_LOG, L_MISC, "Could not connect to '%s' at %s (port %u): %s\n", log_service_name, addr, port, gai_strerror(ret));
       return -1;
     }
 
@@ -324,6 +324,44 @@ net_bind(short unsigned *port, int type, const char *log_service_name)
   close(fd);
   return -1;
 }
+
+int
+net_evhttp_bind(struct evhttp *evhttp, short unsigned port, const char *log_service_name)
+{
+  const char *bind_address;
+
+  bind_address = cfg_getstr(cfg_getsec(cfg, "general"), "bind_address");
+  if (!bind_address)
+    bind_address = cfg_getbool(cfg_getsec(cfg, "general"), "ipv6") ? "::" : "0.0.0.0";
+
+  return evhttp_bind_socket(evhttp, bind_address, port);
+}
+/* TODO check if the below is required for FreeBSD
+  if (v6enabled)
+    {
+      ret = evhttp_bind_socket(evhttpd, "::", httpd_port);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_HTTPD, "Could not bind to port %d with IPv6, falling back to IPv4\n", httpd_port);
+	  v6enabled = 0;
+	}
+    }
+
+  ret = evhttp_bind_socket(evhttpd, "0.0.0.0", httpd_port);
+  if (ret < 0)
+    {
+      if (!v6enabled)
+	{
+	  DPRINTF(E_FATAL, L_HTTPD, "Could not bind to port %d (forked-daapd already running?)\n", httpd_port);
+	  goto bind_fail;
+	}
+
+#ifndef __linux__
+      // Linux will listen on both ipv6 and ipv4, but FreeBSD won't
+      DPRINTF(E_LOG, L_HTTPD, "Could not bind to port %d with IPv4, listening on IPv6 only\n", httpd_port);
+#endif
+    }
+*/
 
 
 /* ----------------------- Conversion/hashing/sanitizers -------------------- */
